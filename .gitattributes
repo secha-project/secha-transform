@@ -1,0 +1,7 @@
+# Normalise line endings: LF in the repo, auto on checkout. Keeps Windows dev + Linux CI consistent.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.parquet binary
+*.png binary
+*.svg text
