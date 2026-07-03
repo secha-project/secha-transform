@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date as date_type
 from typing import Annotated
 
 import typer
@@ -30,12 +31,27 @@ def mx_electrix(
 ) -> None:
     """Transform raw MX Electrix `/measurements/` for a date into canonical rows."""
     transform_logging.configure()
+    try:
+        date_type.fromisoformat(date)
+    except ValueError as exc:
+        raise typer.BadParameter(f"--date must be YYYY-MM-DD, got {date!r}") from exc
+
     settings = Settings()
-    bundle = load_bundle(settings.metadata_root, "mx_electrix")
+    try:
+        bundle = load_bundle(settings.metadata_root, "mx_electrix")
+    except FileNotFoundError as exc:
+        typer.secho(
+            f"{exc} — point SECHA_METADATA_ROOT at a secha-metadata checkout (see .env.template)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
     records = read_measurements(settings.landing_root, "mx_electrix", date, meter)
     factors = read_device_factors(settings.landing_root, "mx_electrix", date, bundle)
     rows = transform_records(records, bundle, factors)
-    path = write_canonical_parquet(rows, settings.canonical_root)
+    run_tag = f"{date}-meter-{meter or 'all'}"
+    path = write_canonical_parquet(rows, settings.canonical_root, run_tag=run_tag)
     typer.echo(f"Transformed {len(records)} record(s) -> {len(rows)} canonical rows -> {path}")
 
 

@@ -23,6 +23,7 @@ _DEFAULT_ID_KEY = [
     "phase",
     "variant",
     "harmonic_order",
+    "aggregation",
     "source_row_id",
 ]
 
@@ -35,11 +36,19 @@ def _now_iso() -> str:
 
 
 def _to_utc(value: Any) -> str | None:
-    """Attach UTC to a naive ISO timestamp (source timestamps are UTC; raw has no marker)."""
+    """Attach UTC to a naive ISO timestamp (source timestamps are UTC; raw has no marker).
+
+    Timezone-aware timestamps (including negative offsets like -05:00) pass through
+    unchanged; an unparseable timestamp yields None — never a fabricated "Z".
+    """
     if value is None:
         return None
     text = str(value)
-    return text if (text.endswith("Z") or "+" in text) else text + "Z"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return text if parsed.tzinfo is not None else text + "Z"
 
 
 def _resolve_factor(factor_field: str, factors: Mapping[str, float]) -> float | None:
@@ -50,13 +59,22 @@ def _resolve_factor(factor_field: str, factors: Mapping[str, float]) -> float | 
 
 
 def _apply_transform(col: dict[str, Any], raw: Any, factors: Mapping[str, float]) -> float | None:
-    """Apply a column's named transform. Returns None when the value cannot be produced."""
+    """Apply a column's named transform. Returns None when the value cannot be produced.
+
+    Unimplemented transforms raise: silently falling back to `float(raw)` would let a
+    config author use a library-legal rule and get wrong behaviour with no error.
+    """
     transform = col.get("transform", "none")
+    if transform == "none":
+        return float(raw)
     if transform == "scale_by_factor":
         factor = _resolve_factor(col["args"]["factor_field"], factors)
         return None if factor is None else float(raw) * factor
-    # "none" (and other value-preserving rules): canonical values are numeric.
-    return float(raw)
+    if transform == "parse_decimal":
+        separator = (col.get("args") or {}).get("decimal_separator", ".")
+        text = str(raw)
+        return float(text.replace(separator, ".")) if separator != "." else float(text)
+    raise ValueError(f"transform '{transform}' is not implemented by this engine")
 
 
 def transform_records(
@@ -83,6 +101,7 @@ def transform_records(
     source_dataset = mapping.get("source", "")
     schema_version = str(mapping.get("target_schema_version", "1.0.0"))
     id_key = bundle.target.get("measurement_id_from", _DEFAULT_ID_KEY)
+    ingested_at = _now_iso()  # one stamp per run: rows of a batch share their provenance instant
 
     rows: list[CanonicalRow] = []
     for record in records:
@@ -130,6 +149,7 @@ def transform_records(
                 "phase": phase,
                 "variant": variant,
                 "harmonic_order": harmonic_order,
+                "aggregation": aggregation,
                 "source_row_id": source_row_id,
             }
             rows.append(
@@ -150,7 +170,7 @@ def transform_records(
                     quality="ok",
                     source_row_id=source_row_id,
                     schema_version=schema_version,
-                    ingested_at=_now_iso(),
+                    ingested_at=ingested_at,
                 )
             )
     return rows

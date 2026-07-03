@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from secha_transform.engine.transform import transform_records
 from secha_transform.metadata.loader import MetadataBundle
 
@@ -85,3 +87,60 @@ def test_idempotent_measurement_id_is_stable() -> None:
     a = transform_records([record], _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
     b = transform_records([record], _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
     assert [r.measurement_id for r in a] == [r.measurement_id for r in b]
+
+
+def test_unknown_transform_raises() -> None:
+    """A library-legal transform the engine does not implement must fail loudly, not float()."""
+    bundle = _bundle()
+    bundle.mapping["columns"] = [
+        {"src": "v", "quantity": "voltage", "phase": "L1", "unit": "V", "transform": "slugify"}
+    ]
+    with pytest.raises(ValueError, match="not implemented"):
+        transform_records([{"meter": 7, "ts": "t", "id": 1, "v": 230.0}], bundle, {})
+
+
+def test_parse_decimal_handles_comma_locale() -> None:
+    """The EE-documented locale case: comma decimal separators parse correctly."""
+    bundle = _bundle()
+    bundle.mapping["columns"] = [
+        {
+            "src": "v",
+            "quantity": "voltage",
+            "phase": "L1",
+            "unit": "V",
+            "transform": "parse_decimal",
+            "args": {"decimal_separator": ","},
+        }
+    ]
+    rows = transform_records(
+        [{"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": "1,25"}], bundle, {}
+    )
+    assert rows[0].value == 1.25
+
+
+def test_timezone_aware_timestamp_passes_through() -> None:
+    """Negative offsets must not get a fabricated Z appended."""
+    rows = transform_records(
+        [{"meter": 7, "ts": "2025-01-01T00:00:00-05:00", "id": 1, "f": 50.0}],
+        _bundle(),
+        {"7": {"uk": 1.0, "ik": 1.0}},
+    )
+    assert rows[0].ts_utc == "2025-01-01T00:00:00-05:00"
+
+
+def test_unparseable_timestamp_yields_none() -> None:
+    rows = transform_records(
+        [{"meter": 7, "ts": "not-a-time", "id": 1, "f": 50.0}],
+        _bundle(),
+        {"7": {"uk": 1.0, "ik": 1.0}},
+    )
+    assert rows[0].ts_utc is None
+
+
+def test_single_ingested_at_per_run() -> None:
+    records = [
+        {"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": 230.0, "f": 50.0},
+        {"meter": 7, "ts": "2025-01-01T00:01:00", "id": 2, "v": 231.0, "f": 50.0},
+    ]
+    rows = transform_records(records, _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
+    assert len({r.ingested_at for r in rows}) == 1

@@ -92,8 +92,9 @@ uv run secha-transform mx-electrix --date 2025-08-15 --meter 21   # raw landing 
 then run the same commands without the `uv run` prefix.)
 
 > A run only transforms what `secha-ingestion` has already **landed** for that date/meter. If nothing is
-> landed you get `Transformed 0 record(s)` — land the day first with `secha-ingest`. The parquet writer
-> **appends**, so clear `data/canonical` before re-running to avoid duplicate rows.
+> landed you get `Transformed 0 record(s)` — land the day first with `secha-ingest`. Re-running the same
+> date/meter **replaces** that run's output (run-scoped part files); when a partition holds several landed
+> snapshots, the reader uses only the **latest** one (by the envelope's `fetched_at`).
 
 The golden test reads the contract from `SECHA_METADATA_ROOT` (defaults to the sibling `secha-metadata`
 checkout); the unit tests need nothing external.
@@ -105,7 +106,8 @@ if needed, a CLI subcommand here. The engine already interprets any well-formed 
 
 ## Status / open items
 - **Scope:** MX Electrix `/measurements/` slice. Primitives implemented: unpivot, `none`,
-  `scale_by_factor`, UTC timestamping. Validation application and the full primitive set follow as
+  `scale_by_factor`, `parse_decimal` (locale separators), UTC timestamping, latest-snapshot selection.
+  Unimplemented transforms fail loudly. Validation application and the full primitive set follow as
   column families are mapped.
 - **Phase 3 (Delta/UC)** requires the TUNI VPN + a Unity Catalog token; canonical input for Spark must
   live on the cluster NFS (`/net/nfs`).
