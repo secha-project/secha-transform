@@ -66,7 +66,10 @@ docs/         architecture diagram
 ## Build phases
 - **Phase 1 (done):** pure-Python engine; **golden test green** against the `secha-metadata` contract;
   the sink writes a local **parquet** dataset (the columnar form Delta stores).
-- **Phase 2:** apply the `validation.yaml` rules and add remaining primitives as column families are mapped.
+- **Phase 2 (done):** the engine applies `validation.yaml` — record rules (`not_null` → reject) run on
+  the raw record, quantity rules (`range` → flag `suspect` / drop / reject) run on emitted values; every
+  outcome is **counted** in the run stats (`TransformResult.stats`), and a declared rule the engine
+  cannot honour **raises**. Remaining primitives are added as column families are mapped.
 - **Phase 3:** write to **Delta / Unity Catalog** via Spark Connect on the TUNI cluster (the `spark`
   optional dependency), `MERGE` on `measurement_id`; build the wide `serving` views.
 
@@ -106,8 +109,8 @@ if needed, a CLI subcommand here. The engine already interprets any well-formed 
 
 ## Status / open items
 - **Scope:** MX Electrix `/measurements/` slice. Primitives implemented: unpivot, `none`,
-  `scale_by_factor`, `parse_decimal` (locale separators), UTC timestamping, latest-snapshot selection.
-  Unimplemented transforms fail loudly. Validation application and the full primitive set follow as
-  column families are mapped.
+  `scale_by_factor`, `parse_decimal` (locale separators), UTC timestamping, latest-snapshot selection,
+  and **validation application** (flag/drop/reject with counted run stats). Unimplemented transforms
+  and rules fail loudly. The full primitive set follows as column families are mapped.
 - **Phase 3 (Delta/UC)** requires the TUNI VPN + a Unity Catalog token; canonical input for Spark must
   live on the cluster NFS (`/net/nfs`).

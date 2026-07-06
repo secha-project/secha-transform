@@ -33,3 +33,23 @@ class CanonicalRow:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class TransformStats:
+    """Run statistics: every validation outcome is counted, never silent."""
+
+    records_in: int = 0
+    records_rejected: int = 0
+    rows_emitted: int = 0
+    rows_suspect: int = 0
+    rows_dropped: int = 0
+    cells_null_skipped: int = 0
+
+
+@dataclass(frozen=True)
+class TransformResult:
+    """The engine's output: canonical rows plus the run's validation statistics."""
+
+    rows: list[CanonicalRow]
+    stats: TransformStats

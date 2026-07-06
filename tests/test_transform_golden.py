@@ -24,7 +24,7 @@ def test_golden_rows_are_produced(metadata_root: Path) -> None:
     raw = load_fixture(metadata_root, "raw_measurements_sample.json")
     expected = load_fixture(metadata_root, "expected_canonical.json")
 
-    produced = [row.to_dict() for row in transform_records(raw, bundle, FACTORS)]
+    produced = [row.to_dict() for row in transform_records(raw, bundle, FACTORS).rows]
 
     for exp in expected:
         assert any(_matches(p, exp) for p in produced), f"missing expected canonical row: {exp}"
@@ -33,7 +33,7 @@ def test_golden_rows_are_produced(metadata_root: Path) -> None:
 def test_no_identity_collapse(metadata_root: Path) -> None:
     bundle = load_bundle(metadata_root, "mx_electrix")
     raw = load_fixture(metadata_root, "raw_measurements_sample.json")
-    rows = transform_records(raw, bundle, FACTORS)
+    rows = transform_records(raw, bundle, FACTORS).rows
     ids = [row.measurement_id for row in rows]
     assert len(ids) == len(set(ids)), "duplicate measurement_id -> identity collapse"
 
@@ -45,7 +45,7 @@ def test_deterministic(metadata_root: Path) -> None:
     def run() -> list[dict]:
         return [
             {k: v for k, v in row.to_dict().items() if k != "ingested_at"}
-            for row in transform_records(raw, bundle, FACTORS)
+            for row in transform_records(raw, bundle, FACTORS).rows
         ]
 
     assert run() == run()

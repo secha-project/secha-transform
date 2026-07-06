@@ -49,10 +49,15 @@ def mx_electrix(
 
     records = read_measurements(settings.landing_root, "mx_electrix", date, meter)
     factors = read_device_factors(settings.landing_root, "mx_electrix", date, bundle)
-    rows = transform_records(records, bundle, factors)
+    result = transform_records(records, bundle, factors)
     run_tag = f"{date}-meter-{meter or 'all'}"
-    path = write_canonical_parquet(rows, settings.canonical_root, run_tag=run_tag)
-    typer.echo(f"Transformed {len(records)} record(s) -> {len(rows)} canonical rows -> {path}")
+    path = write_canonical_parquet(result.rows, settings.canonical_root, run_tag=run_tag)
+    stats = result.stats
+    typer.echo(
+        f"Transformed {stats.records_in} record(s) -> {stats.rows_emitted} canonical rows "
+        f"({stats.rows_suspect} suspect, {stats.rows_dropped} dropped, "
+        f"{stats.records_rejected} records rejected) -> {path}"
+    )
 
 
 if __name__ == "__main__":

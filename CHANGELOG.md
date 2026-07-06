@@ -4,6 +4,14 @@ All notable changes to `secha-transform` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added (Phase 2)
+- The engine now applies the vendor's `validation.yaml` (the fifth metadata type): record-level
+  `not_null` rules reject raw records; quantity-level `range` rules flag emitted rows `suspect`
+  (value kept), drop single rows, or reject the whole record. Declared rules the engine cannot
+  honour raise instead of being silently ignored.
+- `transform_records` now returns `TransformResult(rows, stats)` — run statistics (records in/rejected,
+  rows emitted/suspect/dropped, null cells skipped) are first-class and reported by the CLI.
+  **Breaking:** callers previously received a plain row list.
 ### Fixed
 - Reader now selects the **latest landed snapshot** per partition (by the envelope's `fetched_at`),
   implementing the source schema's `snapshot_selection`. Previously all snapshots were read, producing

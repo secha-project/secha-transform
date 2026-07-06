@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
+from secha_transform.engine.models import CanonicalRow
 from secha_transform.engine.transform import transform_records
 from secha_transform.metadata.loader import MetadataBundle
 
 
-def _bundle() -> MetadataBundle:
+def _bundle(validation: dict[str, Any] | None = None) -> MetadataBundle:
     return MetadataBundle(
         vendor="demo",
         canonical={},
@@ -47,12 +50,20 @@ def _bundle() -> MetadataBundle:
                 },
             ],
         },
-        validation={},
+        validation=validation or {},
     )
 
 
+def _rows(
+    records: list[dict[str, Any]],
+    bundle: MetadataBundle,
+    factors: dict[str, dict[str, float]] | None = None,
+) -> list[CanonicalRow]:
+    return transform_records(records, bundle, factors or {}).rows
+
+
 def test_scaling_multiplies_by_device_factor() -> None:
-    rows = transform_records(
+    rows = _rows(
         [{"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": 230.0, "f": 50.0}],
         _bundle(),
         {"7": {"uk": 2.0, "ik": 1.0}},
@@ -67,25 +78,24 @@ def test_scaling_multiplies_by_device_factor() -> None:
 
 
 def test_missing_factor_skips_scaled_column() -> None:
-    rows = transform_records(
-        [{"meter": 7, "ts": "t", "id": 1, "v": 230.0, "f": 50.0}], _bundle(), {}
-    )
+    rows = _rows([{"meter": 7, "ts": "t", "id": 1, "v": 230.0, "f": 50.0}], _bundle())
     assert {r.quantity for r in rows} == {"frequency"}  # voltage skipped (no factor)
 
 
-def test_null_cell_is_skipped() -> None:
-    rows = transform_records(
+def test_null_cell_is_skipped_and_counted() -> None:
+    result = transform_records(
         [{"meter": 7, "ts": "t", "id": 1, "v": None, "f": 50.0}],
         _bundle(),
         {"7": {"uk": 1.0, "ik": 1.0}},
     )
-    assert {r.quantity for r in rows} == {"frequency"}
+    assert {r.quantity for r in result.rows} == {"frequency"}
+    assert result.stats.cells_null_skipped == 1
 
 
 def test_idempotent_measurement_id_is_stable() -> None:
     record = {"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": 230.0, "f": 50.0}
-    a = transform_records([record], _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
-    b = transform_records([record], _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
+    a = _rows([record], _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
+    b = _rows([record], _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
     assert [r.measurement_id for r in a] == [r.measurement_id for r in b]
 
 
@@ -112,15 +122,13 @@ def test_parse_decimal_handles_comma_locale() -> None:
             "args": {"decimal_separator": ","},
         }
     ]
-    rows = transform_records(
-        [{"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": "1,25"}], bundle, {}
-    )
+    rows = _rows([{"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": "1,25"}], bundle)
     assert rows[0].value == 1.25
 
 
 def test_timezone_aware_timestamp_passes_through() -> None:
     """Negative offsets must not get a fabricated Z appended."""
-    rows = transform_records(
+    rows = _rows(
         [{"meter": 7, "ts": "2025-01-01T00:00:00-05:00", "id": 1, "f": 50.0}],
         _bundle(),
         {"7": {"uk": 1.0, "ik": 1.0}},
@@ -129,7 +137,7 @@ def test_timezone_aware_timestamp_passes_through() -> None:
 
 
 def test_unparseable_timestamp_yields_none() -> None:
-    rows = transform_records(
+    rows = _rows(
         [{"meter": 7, "ts": "not-a-time", "id": 1, "f": 50.0}],
         _bundle(),
         {"7": {"uk": 1.0, "ik": 1.0}},
@@ -142,5 +150,5 @@ def test_single_ingested_at_per_run() -> None:
         {"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": 230.0, "f": 50.0},
         {"meter": 7, "ts": "2025-01-01T00:01:00", "id": 2, "v": 231.0, "f": 50.0},
     ]
-    rows = transform_records(records, _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
+    rows = _rows(records, _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
     assert len({r.ingested_at for r in rows}) == 1

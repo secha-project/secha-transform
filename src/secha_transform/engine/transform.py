@@ -1,8 +1,9 @@
 """The deterministic, vendor-blind transform: raw records + metadata -> canonical rows.
 
 Pure function. No vendor logic — it only interprets the metadata bundle. A wide source record is
-unpivoted into long canonical rows (one per measured quantity); same input + same config gives
-identical output (apart from the runtime `ingested_at` stamp).
+unpivoted into long canonical rows (one per measured quantity); the vendor's validation rules are
+applied (flag/drop/reject, all counted); same input + same config gives identical output (apart
+from the runtime `ingested_at` stamp).
 """
 
 from __future__ import annotations
@@ -12,7 +13,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from secha_transform.engine.identity import measurement_id
-from secha_transform.engine.models import CanonicalRow
+from secha_transform.engine.models import CanonicalRow, TransformResult, TransformStats
+from secha_transform.engine.validation import parse_rules
 from secha_transform.metadata.loader import MetadataBundle
 
 _DEFAULT_ID_KEY = [
@@ -81,11 +83,13 @@ def transform_records(
     records: list[dict[str, Any]],
     bundle: MetadataBundle,
     device_factors: Mapping[str, Mapping[str, float]] | None = None,
-) -> list[CanonicalRow]:
-    """Transform raw vendor records into canonical long-format rows, per the metadata bundle."""
+) -> TransformResult:
+    """Transform raw vendor records into canonical long rows + run stats, per the bundle."""
     factors_by_meter = device_factors or {}
     source = bundle.source_schema
     mapping = bundle.mapping
+    rules = parse_rules(bundle.validation)
+    stats = TransformStats()
 
     record_cfg = source.get("record", {})
     meter_field = record_cfg.get("meter_field", "meter")
@@ -105,6 +109,23 @@ def transform_records(
 
     rows: list[CanonicalRow] = []
     for record in records:
+        stats.records_in += 1
+
+        # record-level rules run against the RAW record, before any unpivoting
+        record_suspect = False
+        record_rejected = False
+        for rule in rules.record_rules:
+            if rule.passes(record.get(rule.target_field or "")):
+                continue
+            if rule.on_fail == "flag_suspect":
+                record_suspect = True
+            else:  # reject_row / drop_row at record level both discard the record
+                record_rejected = True
+                break
+        if record_rejected:
+            stats.records_rejected += 1
+            continue
+
         meter = str(record[meter_field])
         device_id = device_template.format(**record)
         ts_utc = _to_utc(record.get(ts_field))
@@ -116,6 +137,7 @@ def transform_records(
         for col in mapping.get("columns", []):
             raw = record.get(col["src"])
             if raw is None:
+                stats.cells_null_skipped += 1
                 continue
             value = _apply_transform(col, raw, factors)
             if value is None:  # e.g. a scaling factor is unavailable for this device
@@ -135,12 +157,33 @@ def transform_records(
                 for idx, phase in gen["phase_map"].items():
                     raw = record.get(gen["pattern"].format(order=order, p=idx))
                     if raw is None:
+                        stats.cells_null_skipped += 1
                         continue
                     emitted.append(
                         (gen["quantity"], phase, "none", int(order), gen["unit"], float(raw))
                     )
 
+        # rows are buffered per record so a reject_row can discard the whole record cleanly
+        record_rows: list[CanonicalRow] = []
         for quantity, phase, variant, harmonic_order, unit, value in emitted:
+            quality = "suspect" if record_suspect else "ok"
+            dropped = False
+            for rule in rules.quantity_rules.get(quantity, ()):
+                if rule.passes(value):
+                    continue
+                if rule.on_fail == "flag_suspect":
+                    quality = "suspect"
+                elif rule.on_fail == "drop_row":
+                    dropped = True
+                    break
+                else:  # reject_row: the whole record is poisoned
+                    record_rejected = True
+                    break
+            if record_rejected:
+                break
+            if dropped:
+                stats.rows_dropped += 1
+                continue
             key_values = {
                 "source_vendor": bundle.vendor,
                 "device_id": device_id,
@@ -152,7 +195,9 @@ def transform_records(
                 "aggregation": aggregation,
                 "source_row_id": source_row_id,
             }
-            rows.append(
+            if quality == "suspect":
+                stats.rows_suspect += 1
+            record_rows.append(
                 CanonicalRow(
                     measurement_id=measurement_id(id_key, key_values),
                     source_vendor=bundle.vendor,
@@ -167,10 +212,17 @@ def transform_records(
                     unit=unit,
                     aggregation=aggregation,
                     interval_s=interval_s,
-                    quality="ok",
+                    quality=quality,
                     source_row_id=source_row_id,
                     schema_version=schema_version,
                     ingested_at=ingested_at,
                 )
             )
-    return rows
+        if record_rejected:
+            stats.records_rejected += 1
+            stats.rows_suspect -= sum(1 for r in record_rows if r.quality == "suspect")
+            continue
+        rows.extend(record_rows)
+
+    stats.rows_emitted = len(rows)
+    return TransformResult(rows=rows, stats=stats)
