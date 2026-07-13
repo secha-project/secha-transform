@@ -1,4 +1,4 @@
-"""IO tests: snapshot selection + UTF-8 in the reader; run-scoped idempotency in the writer."""
+"""IO tests: snapshot selection, formats + UTF-8 in the reader; idempotency in the writer."""
 
 from __future__ import annotations
 
@@ -8,38 +8,70 @@ from pathlib import Path
 import pyarrow.dataset as ds
 
 from secha_transform.engine.models import CanonicalRow
-from secha_transform.io.reader import read_measurements
+from secha_transform.io.reader import read_records
 from secha_transform.io.writer import write_canonical_parquet
 
+WIDE_SCHEMA = {
+    "access": {"layout": "vendor=demo/source=measurements/date={date}/meter={meter}"},
+    "format": {"type": "json", "encoding": "utf-8"},
+    "fields": [],
+}
+LONG_SCHEMA = {
+    "access": {"layout": "vendor=demo2/source=daily_dump/date={date}"},
+    "format": {"type": "csv", "delimiter": "\t", "header": False, "encoding": "utf-8"},
+    "fields": [
+        {"name": "measurement_id", "type": "long"},
+        {"name": "value", "type": "string"},
+        {"name": "timestamp", "type": "long"},
+    ],
+}
 
-def _land(directory: Path, name: str, payload: object, fetched_at: str) -> None:
+
+def _land(directory: Path, name: str, body: bytes, fetched_at: str, ext: str = "json") -> None:
     """Mimic the secha-ingestion landing layout: payload + envelope sidecar."""
     directory.mkdir(parents=True, exist_ok=True)
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    (directory / f"{name}.json").write_bytes(body)
+    (directory / f"{name}.{ext}").write_bytes(body)
     meta = json.dumps({"fetched_at": fetched_at}).encode("utf-8")
     (directory / f"{name}.meta.json").write_bytes(meta)
+
+
+def _json_body(payload: object) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def test_reader_picks_latest_snapshot(tmp_path: Path) -> None:
     """Ingestion keeps every changed snapshot; the reader must use only the newest one."""
     part = tmp_path / "vendor=demo" / "source=measurements" / "date=2025-01-01" / "meter=1"
-    _land(part, "aaaa", [{"id": 1, "v": 1.0}], "2026-01-01T00:00:00+00:00")
-    _land(part, "bbbb", [{"id": 1, "v": 2.0}], "2026-01-02T00:00:00+00:00")  # revised, newer
+    _land(part, "aaaa", _json_body([{"id": 1, "v": 1.0}]), "2026-01-01T00:00:00+00:00")
+    _land(part, "bbbb", _json_body([{"id": 1, "v": 2.0}]), "2026-01-02T00:00:00+00:00")
 
-    records = read_measurements(str(tmp_path), "demo", "2025-01-01", "1")
+    records = list(read_records(str(tmp_path), WIDE_SCHEMA, "2025-01-01", "1"))
 
-    assert records == [{"id": 1, "v": 2.0}]  # latest only — no duplicates, no stale values
+    assert records == [{"id": 1, "v": 2.0}]  # latest only: no duplicates, no stale values
 
 
 def test_reader_decodes_utf8(tmp_path: Path) -> None:
     """Raw payloads must be decoded as UTF-8, not the platform encoding."""
     part = tmp_path / "vendor=demo" / "source=measurements" / "date=2025-01-01" / "meter=1"
-    _land(part, "aaaa", [{"id": 1, "location": "Sähkötalo"}], "2026-01-01T00:00:00+00:00")
+    _land(part, "aaaa", _json_body([{"id": 1, "location": "Sähkötalo"}]), "2026-01-01T00:00:00Z")
 
-    records = read_measurements(str(tmp_path), "demo", "2025-01-01", "1")
+    records = list(read_records(str(tmp_path), WIDE_SCHEMA, "2025-01-01", "1"))
 
     assert records[0]["location"] == "Sähkötalo"
+
+
+def test_reader_parses_dsv_per_format_descriptor(tmp_path: Path) -> None:
+    """A long/DSV source is read via its layout (no meter) and parsed per `format:`."""
+    part = tmp_path / "vendor=demo2" / "source=daily_dump" / "date=2026-06-15"
+    body = b"23501\t49.987724\t1781470800246\nnot a triple\n23502\t-45.1\t1781470800246\n"
+    _land(part, "cccc", body, "2026-06-16T00:00:00+00:00", ext="csv")
+
+    records = list(read_records(str(tmp_path), LONG_SCHEMA, "2026-06-15"))
+
+    assert records == [  # strings preserved; malformed line skipped (counted at landing)
+        {"measurement_id": "23501", "value": "49.987724", "timestamp": "1781470800246"},
+        {"measurement_id": "23502", "value": "-45.1", "timestamp": "1781470800246"},
+    ]
 
 
 def _row(i: int) -> CanonicalRow:

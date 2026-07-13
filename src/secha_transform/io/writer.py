@@ -1,6 +1,6 @@
 """Write canonical rows.
 
-Phase 1: local **parquet** dataset, Hive-partitioned by `source_vendor` + `event_date` — the same
+Phase 1: local **parquet** dataset, Hive-partitioned by `source_vendor` + `event_date`, the same
 columnar form Delta stores underneath. Phase 3 swaps this for a Delta/Unity-Catalog MERGE on the
 TUNI Spark Connect cluster (the `spark` extra), keyed on `measurement_id`.
 
@@ -8,7 +8,7 @@ Idempotency (Phase 1): part files are named after the run scope (`run_tag`), and
 are overwritten (`overwrite_or_ignore`). Re-running the same scope replaces its own output;
 other scopes (e.g. another meter sharing the same date partition) are untouched. A blunt
 `delete_matching` would be unsafe here because partitions are vendor+date, not per-meter.
-Caveat: if a re-run produces fewer part files than before, stale higher-numbered parts remain —
+Caveat: if a re-run produces fewer part files than before, stale higher-numbered parts remain;
 acceptable at slice sizes (one file per scope), resolved for real by the Phase-3 MERGE.
 """
 

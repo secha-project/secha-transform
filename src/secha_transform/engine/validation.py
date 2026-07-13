@@ -9,7 +9,7 @@ Rule targets:
 - the entity rule (measurement.value not_null -> drop) is satisfied by construction: the
   engine never emits null values (null cells are counted, not silently ignored).
 
-A declared rule the engine cannot honour raises — never silently ignored.
+A declared rule the engine cannot honour raises; it is never silently ignored.
 """
 
 from __future__ import annotations

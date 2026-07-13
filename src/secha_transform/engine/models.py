@@ -1,4 +1,4 @@
-"""The canonical row — one long-format measurement produced by the engine."""
+"""The canonical row: one long-format measurement produced by the engine."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ class TransformStats:
 
     records_in: int = 0
     records_rejected: int = 0
+    records_unmapped: int = 0  # long sources: landed keys not (yet) in the mapping rows
     rows_emitted: int = 0
     rows_suspect: int = 0
     rows_dropped: int = 0

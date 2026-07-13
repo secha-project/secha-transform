@@ -1,6 +1,6 @@
 """Load the secha-metadata rulebook into an in-memory bundle.
 
-The engine depends ONLY on this bundle, never on a vendor name — vendor knowledge is in the config.
+The engine depends ONLY on this bundle, never on a vendor name; vendor knowledge is in the config.
 Assumed already validated by secha-metadata's `validate.py` (schema + cross-ref + no-collapse); this
 loader just reads it.
 """

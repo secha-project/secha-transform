@@ -1,14 +1,15 @@
 """The deterministic, vendor-blind transform: raw records + metadata -> canonical rows.
 
-Pure function. No vendor logic — it only interprets the metadata bundle. A wide source record is
-unpivoted into long canonical rows (one per measured quantity); the vendor's validation rules are
+Pure function. No vendor logic; it only interprets the metadata bundle. Wide source records
+(shape: wide) are unpivoted via `columns:`/`generated:`; long source records (shape: long) are
+resolved via `rows:` keyed on the record's key-field value. The vendor's validation rules are
 applied (flag/drop/reject, all counted); same input + same config gives identical output (apart
 from the runtime `ingested_at` stamp).
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,28 +30,43 @@ _DEFAULT_ID_KEY = [
     "source_row_id",
 ]
 
-# emitted tuple: (quantity, phase, variant, harmonic_order, unit, value)
-_Emitted = tuple[str, str, str, int | None, str, float]
+# emitted tuple: (quantity, phase, variant, harmonic_order, unit, value, aggregation)
+_Emitted = tuple[str, str, str, int | None, str, float, str]
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _to_utc(value: Any) -> str | None:
-    """Attach UTC to a naive ISO timestamp (source timestamps are UTC; raw has no marker).
+def _to_utc(value: Any, datetime_format: str = "iso8601") -> str | None:
+    """Normalise a source timestamp to an ISO-8601 UTC string, per the declared format.
 
-    Timezone-aware timestamps (including negative offsets like -05:00) pass through
-    unchanged; an unparseable timestamp yields None — never a fabricated "Z".
+    iso8601: naive values get "Z" attached (sources declare UTC); timezone-aware values
+    (including negative offsets) pass through; unparseable yields None, never a
+    fabricated zone. epoch_ms / epoch_s: integer epochs render as exact UTC instants
+    (integer math, so milliseconds can never float-round); unparseable yields None.
+    A declared format the engine cannot honour raises.
     """
     if value is None:
         return None
     text = str(value)
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return text if parsed.tzinfo is not None else text + "Z"
+    if datetime_format == "iso8601":
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return text if parsed.tzinfo is not None else text + "Z"
+    if datetime_format in ("epoch_ms", "epoch_s"):
+        try:
+            ticks = int(text)
+        except ValueError:
+            return None
+        if datetime_format == "epoch_ms":
+            seconds, millis = divmod(ticks, 1000)
+            base = datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            return f"{base}.{millis:03d}Z"
+        return datetime.fromtimestamp(ticks, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    raise ValueError(f"datetime_format '{datetime_format}' is not implemented by this engine")
 
 
 def _resolve_factor(factor_field: str, factors: Mapping[str, float]) -> float | None:
@@ -80,7 +96,7 @@ def _apply_transform(col: dict[str, Any], raw: Any, factors: Mapping[str, float]
 
 
 def transform_records(
-    records: list[dict[str, Any]],
+    records: Iterable[dict[str, Any]],
     bundle: MetadataBundle,
     device_factors: Mapping[str, Mapping[str, float]] | None = None,
 ) -> TransformResult:
@@ -92,15 +108,24 @@ def transform_records(
     stats = TransformStats()
 
     record_cfg = source.get("record", {})
-    meter_field = record_cfg.get("meter_field", "meter")
+    meter_field = record_cfg.get("meter_field")  # optional: long sources have no meter concept
     ts_field = record_cfg.get("timestamp_field", "timestamp")
     row_id_field = record_cfg.get("row_id_field", "id")
-    device_template = record_cfg.get(
-        "device_id_template", bundle.vendor + ":meter:{" + meter_field + "}"
+    default_template = (
+        f"{bundle.vendor}:meter:{{{meter_field}}}" if meter_field else f"{bundle.vendor}:device"
     )
+    device_template = record_cfg.get("device_id_template", default_template)
     defaults = source.get("defaults", {})
     aggregation = defaults.get("aggregation", "instantaneous")
     interval_s = defaults.get("interval_s")
+
+    shape = source.get("shape", "wide")
+    datetime_format = source.get("format", {}).get("datetime_format", "iso8601")
+    key_field = record_cfg.get("key_field")
+    value_field = record_cfg.get("value_field")
+    if shape == "long" and not (key_field and value_field):
+        raise ValueError("shape 'long' requires record.key_field and record.value_field")
+    rows_by_key = {str(entry["key"]): entry for entry in mapping.get("rows", [])}
 
     source_dataset = mapping.get("source", "")
     schema_version = str(mapping.get("target_schema_version", "1.0.0"))
@@ -126,46 +151,79 @@ def transform_records(
             stats.records_rejected += 1
             continue
 
-        meter = str(record[meter_field])
+        meter = str(record[meter_field]) if meter_field else None
         device_id = device_template.format(**record)
-        ts_utc = _to_utc(record.get(ts_field))
+        ts_utc = _to_utc(record.get(ts_field), datetime_format)
         raw_row_id = record.get(row_id_field)
         source_row_id = None if raw_row_id is None else str(raw_row_id)
-        factors = factors_by_meter.get(meter, {})
+        factors = factors_by_meter.get(meter, {}) if meter is not None else {}
 
         emitted: list[_Emitted] = []
-        for col in mapping.get("columns", []):
-            raw = record.get(col["src"])
+        if shape == "long":
+            # long source: one record = one reading; the rows table gives it meaning
+            entry = rows_by_key.get(str(record.get(key_field)))
+            if entry is None:
+                stats.records_unmapped += 1  # landed but not (yet) mapped; config decides
+                continue
+            raw = record.get(value_field)
             if raw is None:
                 stats.cells_null_skipped += 1
                 continue
-            value = _apply_transform(col, raw, factors)
-            if value is None:  # e.g. a scaling factor is unavailable for this device
-                continue
-            emitted.append(
-                (
-                    col["quantity"],
-                    col["phase"],
-                    col.get("variant", "none"),
-                    None,
-                    col["unit"],
-                    value,
-                )
-            )
-        for gen in mapping.get("generated", []):
-            for order in gen["order"]:
-                for idx, phase in gen["phase_map"].items():
-                    raw = record.get(gen["pattern"].format(order=order, p=idx))
-                    if raw is None:
-                        stats.cells_null_skipped += 1
-                        continue
-                    emitted.append(
-                        (gen["quantity"], phase, "none", int(order), gen["unit"], float(raw))
+            value = _apply_transform(entry, raw, factors)
+            if value is not None:
+                emitted.append(
+                    (
+                        entry["quantity"],
+                        entry["phase"],
+                        entry.get("variant", "none"),
+                        entry.get("harmonic_order"),
+                        entry["unit"],
+                        value,
+                        entry.get("aggregation", aggregation),
                     )
+                )
+        else:
+            for col in mapping.get("columns", []):
+                raw = record.get(col["src"])
+                if raw is None:
+                    stats.cells_null_skipped += 1
+                    continue
+                value = _apply_transform(col, raw, factors)
+                if value is None:  # e.g. a scaling factor is unavailable for this device
+                    continue
+                emitted.append(
+                    (
+                        col["quantity"],
+                        col["phase"],
+                        col.get("variant", "none"),
+                        None,
+                        col["unit"],
+                        value,
+                        aggregation,
+                    )
+                )
+            for gen in mapping.get("generated", []):
+                for order in gen["order"]:
+                    for idx, phase in gen["phase_map"].items():
+                        raw = record.get(gen["pattern"].format(order=order, p=idx))
+                        if raw is None:
+                            stats.cells_null_skipped += 1
+                            continue
+                        emitted.append(
+                            (
+                                gen["quantity"],
+                                phase,
+                                "none",
+                                int(order),
+                                gen["unit"],
+                                float(raw),
+                                aggregation,
+                            )
+                        )
 
         # rows are buffered per record so a reject_row can discard the whole record cleanly
         record_rows: list[CanonicalRow] = []
-        for quantity, phase, variant, harmonic_order, unit, value in emitted:
+        for quantity, phase, variant, harmonic_order, unit, value, row_aggregation in emitted:
             quality = "suspect" if record_suspect else "ok"
             dropped = False
             for rule in rules.quantity_rules.get(quantity, ()):
@@ -192,7 +250,7 @@ def transform_records(
                 "phase": phase,
                 "variant": variant,
                 "harmonic_order": harmonic_order,
-                "aggregation": aggregation,
+                "aggregation": row_aggregation,
                 "source_row_id": source_row_id,
             }
             if quality == "suspect":
@@ -210,7 +268,7 @@ def transform_records(
                     harmonic_order=harmonic_order,
                     value=value,
                     unit=unit,
-                    aggregation=aggregation,
+                    aggregation=row_aggregation,
                     interval_s=interval_s,
                     quality=quality,
                     source_row_id=source_row_id,

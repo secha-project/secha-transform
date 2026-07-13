@@ -1,4 +1,4 @@
-"""Self-contained engine unit tests (no secha-metadata needed) — scaling, skips, invariants."""
+"""Self-contained engine unit tests (no secha-metadata needed): scaling, skips, invariants."""
 
 from __future__ import annotations
 
@@ -152,3 +152,87 @@ def test_single_ingested_at_per_run() -> None:
     ]
     rows = _rows(records, _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
     assert len({r.ingested_at for r in rows}) == 1
+
+
+# --- long-shape sources (`rows:` mapping keyed by field value) --------------------------
+
+
+def _long_bundle(datetime_format: str = "epoch_ms") -> MetadataBundle:
+    return MetadataBundle(
+        vendor="demo_long",
+        canonical={},
+        vocabulary={},
+        units={},
+        transforms={},
+        target={"measurement_id_from": ["source_vendor", "quantity", "ts_utc", "aggregation"]},
+        source_schema={
+            "shape": "long",
+            "format": {"type": "csv", "delimiter": "\t", "datetime_format": datetime_format},
+            "record": {
+                "key_field": "measurement_id",
+                "value_field": "value",
+                "timestamp_field": "timestamp",
+                "row_id_field": "measurement_id",
+                "device_id_template": "demo:site:device",
+            },
+            "defaults": {"aggregation": "average", "interval_s": 1},
+        },
+        mapping={
+            "source": "daily_dump",
+            "target_schema_version": "1.0.0",
+            "rows": [
+                {"key": "1", "quantity": "voltage", "phase": "L1", "unit": "V"},
+                {
+                    "key": "2",
+                    "quantity": "energy_active_import",
+                    "phase": "none",
+                    "aggregation": "counter",
+                    "unit": "kWh",
+                },
+            ],
+        },
+        validation={},
+    )
+
+
+def test_long_lookup_emits_one_row_per_record() -> None:
+    records = [{"measurement_id": "1", "value": "230.5", "timestamp": "1781470800246"}]
+    result = transform_records(records, _long_bundle())
+    (row,) = result.rows
+    assert row.quantity == "voltage"
+    assert row.value == 230.5
+    assert row.ts_utc == "2026-06-14T21:00:00.246Z"  # exact epoch-ms rendering, no rounding
+    assert row.device_id == "demo:site:device"
+    assert row.source_row_id == "1"
+    assert row.aggregation == "average"
+
+
+def test_long_unmapped_key_is_skipped_and_counted() -> None:
+    records = [{"measurement_id": "99", "value": "1.0", "timestamp": "1781470800246"}]
+    result = transform_records(records, _long_bundle())
+    assert result.rows == []
+    assert result.stats.records_unmapped == 1
+
+
+def test_long_per_row_aggregation_override() -> None:
+    records = [{"measurement_id": "2", "value": "36349.897", "timestamp": "1781470800246"}]
+    result = transform_records(records, _long_bundle())
+    assert result.rows[0].aggregation == "counter"
+
+
+def test_epoch_ms_garbage_timestamp_yields_none() -> None:
+    records = [{"measurement_id": "1", "value": "230.5", "timestamp": "not-epoch"}]
+    result = transform_records(records, _long_bundle())
+    assert result.rows[0].ts_utc is None
+
+
+def test_epoch_s_format_renders_whole_seconds() -> None:
+    records = [{"measurement_id": "1", "value": "230.5", "timestamp": "1781470800"}]
+    result = transform_records(records, _long_bundle(datetime_format="epoch_s"))
+    assert result.rows[0].ts_utc == "2026-06-14T21:00:00Z"
+
+
+def test_unknown_datetime_format_raises() -> None:
+    records = [{"measurement_id": "1", "value": "230.5", "timestamp": "1781470800246"}]
+    with pytest.raises(ValueError, match="datetime_format"):
+        transform_records(records, _long_bundle(datetime_format="stardate"))
