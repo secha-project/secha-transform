@@ -37,7 +37,7 @@ def write_canonical_parquet(
         records.append(record)
     table = pa.Table.from_pylist(records)
     safe_tag = _UNSAFE.sub("-", run_tag)
-    pq.write_to_dataset(  # type: ignore[no-untyped-call]
+    pq.write_to_dataset(
         table,
         root_path=canonical_root,
         partition_cols=["source_vendor", "event_date"],
