@@ -18,7 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # Phase 3: write canonical to Delta / Unity Catalog on the TUNI Spark Connect cluster.
-spark = ["pyspark[connect]>=4.0", "delta-spark>=4.0"]
+# pyspark-client is the slim Spark Connect client; PINNED to the server's Spark 4.1.1
+# (Connect requires matching versions). Delta runs server-side; no client jar needed.
+spark = ["pyspark-client==4.1.1"]
 s3 = ["s3fs>=2024.6"]
 azure = ["adlfs>=2024.4"]
 
@@ -56,6 +58,14 @@ mypy_path = "src"
 [[tool.mypy.overrides]]
 module = ["fsspec", "fsspec.*", "structlog", "structlog.*", "yaml", "pyarrow", "pyarrow.*"]
 ignore_missing_imports = true
+
+# pyspark (the optional spark extra) and its numpy dependency are never analysed:
+# numpy's stubs need Python >= 3.12 syntax while this codebase is checked as 3.11,
+# and skipping keeps local (extra installed) and CI (extra absent) behaviour identical.
+[[tool.mypy.overrides]]
+module = ["pyspark", "pyspark.*", "numpy", "numpy.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 addopts = "-q"

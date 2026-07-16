@@ -1,0 +1,3 @@
+# Pinned to the platform's Spark 4.1.1: the Connect client version must match the server.
+pyspark-client==4.1.1
+requests>=2.32

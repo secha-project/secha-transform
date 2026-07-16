@@ -4,6 +4,31 @@ All notable changes to `secha-transform` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added (Phase 3, Step 2: the Delta / Unity Catalog sink)
+- `io/delta_sink.py`: pure SQL builders (offline-tested) + a thin Spark Connect wrapper.
+  Table DDL is GENERATED from `canonical_schema.yaml` and the target binding, including the
+  platform-required `TBLPROPERTIES ('delta.feature.catalogManaged' = 'supported')`; staged
+  parquet is read from a cluster-visible path, typed per the canonical schema (missing
+  engine columns become typed NULLs), deduplicated on the merge key (latest `ingested_at`
+  wins), and MERGEd on `measurement_id`. Serving views are created from the rulebook's
+  `serving/*.sql` via the `{canonical}` placeholder. Unknown canonical types raise.
+- CLI: `delta-load` (staged parquet -> MERGE, counted report), `delta-views`, and
+  `--sink delta` on both vendor commands (for runs where the canonical output path is
+  cluster-visible). Missing platform env produces a clean error, never a traceback.
+- Serving materialisation is config-driven (`serving_mode` in the target binding): `view`,
+  or `table` for platforms whose catalog connector lacks view/RTAS abilities (this UC
+  connector lacks both), refreshed via drop + explicit DDL from the analysed SELECT +
+  insert-select, using only platform-proven primitives.
+- Settings + `.env.template`: `SECHA_SPARK_URL`, `SECHA_CATALOG_URL`, `SECHA_CATALOG_TOKEN`
+  (secret), `SECHA_STAGING_ROOT`. The `spark` extra is now `pyspark-client==4.1.1`, pinned
+  to the platform's Spark version.
+- Tests: offline builder tests pin every generated SQL statement + an env-gated integration
+  test (real platform, throwaway table, MERGE twice for idempotency, self-cleaning;
+  auto-skipped without the Phase-3 env).
+- **Verified live on the TUNI cluster (2026-07-15):** both proven days staged to NFS and
+  MERGEd into `secha.canonical.measurement` (5,535,568 rows; second load `5535568 ->
+  5535568`, idempotent); `secha.serving.pq_minute_wide` built and answering the
+  cross-vendor convergence query. Platform facts recorded in `docs/phase3-log.md`.
 ### Added (vendor #2, ProCem: three generic capabilities, zero vendor logic)
 - **Long-shape sources** (`shape: long`): mapping `rows:` entries are resolved by the record's
   key-field VALUE (one record → one canonical row), with per-row `aggregation` override (energy

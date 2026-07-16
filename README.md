@@ -84,8 +84,18 @@ docs/         architecture diagram
   the raw record, quantity rules (`range` → flag `suspect` / drop / reject) run on emitted values; every
   outcome is **counted** in the run stats (`TransformResult.stats`), and a declared rule the engine
   cannot honour **raises**. Remaining primitives are added as column families are mapped.
-- **Phase 3:** write to **Delta / Unity Catalog** via Spark Connect on the TUNI cluster (the `spark`
-  optional dependency), `MERGE` on `measurement_id`; build the wide `serving` views.
+- **Phase 3 (done, live on the TUNI cluster):** Delta / Unity Catalog via Spark Connect (the `spark`
+  extra, pinned `pyspark-client==4.1.1`). `io/delta_sink.py` generates the table DDL from
+  `canonical_schema.yaml` + the target's `table_properties` (incl. the platform-required
+  `delta.feature.catalogManaged`), reads cluster-visible staging parquet, dedupes on the merge key
+  (latest `ingested_at` wins), and `MERGE`s on `measurement_id`. Serving definitions come from the
+  rulebook's `serving/*.sql` (`{canonical}` placeholder), materialised per the target's
+  `serving_mode` (Delta snapshots here: this UC connector lacks views and RTAS).
+  CLI: `delta-load`, `delta-views`, and `--sink delta` on the vendor commands.
+  **Verified live:** `secha.canonical.measurement` holds 5,535,568 rows (both vendors; re-running
+  the load reports `5535568 -> 5535568`, the platform-level idempotency proof) and
+  `secha.serving.pq_minute_wide` answers the convergence query. Full record:
+  [docs/phase3-log.md](docs/phase3-log.md).
 
 ## Configuration
 All settings are environment variables prefixed `SECHA_` (read from `.env`; see `.env.template`). None
@@ -96,6 +106,10 @@ are secrets; they are just paths.
 | `SECHA_METADATA_ROOT` | `../secha-metadata` | the rulebook checkout the engine interprets |
 | `SECHA_LANDING_ROOT` | `data/landing` | raw zone (usually `../secha-ingestion/data/landing`) |
 | `SECHA_CANONICAL_ROOT` | `data/canonical` | Phase-1 local canonical parquet output |
+| `SECHA_SPARK_URL` | unset | Phase 3: Spark Connect endpoint (TUNI VPN) |
+| `SECHA_CATALOG_URL` | unset | Phase 3: Unity Catalog API |
+| `SECHA_CATALOG_TOKEN` | unset | Phase 3: UC token (secret; `.env` only) |
+| `SECHA_STAGING_ROOT` | unset | Phase 3: cluster-visible staging path for canonical parquet |
 
 ## Develop & run
 ```bash
@@ -105,6 +119,10 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy src
 uv run secha-transform mx-electrix --date 2025-08-15 --meter 21   # raw landing -> canonical parquet
 uv run secha-transform procem --date 2026-06-15                   # streams + batches 14.5M records
+
+# Phase 3 (needs the spark extra + .env platform values + TUNI VPN):
+uv run secha-transform delta-load --staging /net/nfs/data/secha/canonical-staging/load-001
+uv run secha-transform delta-views                                # rulebook serving/*.sql -> UC snapshots
 ```
 (No uv? `python -m venv .venv && .venv/Scripts/pip install -e . && .venv/Scripts/pip install pytest mypy ruff`,
 then run the same commands without the `uv run` prefix.)
@@ -133,5 +151,7 @@ zero vendor logic (measured in `secha-metadata`'s `docs/onboarding-diary-procem.
   **validation application** (flag/drop/reject with counted run stats). Unimplemented transforms,
   formats, and rules fail loudly. `grep -ril procem src/` matches only the CLI command wiring;
   the engine and IO layers contain zero vendor logic.
-- **Phase 3 (Delta/UC)** requires the TUNI VPN + a Unity Catalog token; canonical input for Spark must
-  live on the cluster NFS (`/net/nfs`).
+- **Phase 3 is live.** Operational notes: platform commands need the TUNI VPN + a Unity Catalog token
+  in `.env`; staged canonical parquet must sit on the cluster NFS (`/net/nfs`); serving snapshots are
+  refreshed by re-running `delta-views` after each `delta-load`. Platform runbook + facts learned:
+  [scripts/phase3/README.md](scripts/phase3/README.md) and [docs/phase3-log.md](docs/phase3-log.md).

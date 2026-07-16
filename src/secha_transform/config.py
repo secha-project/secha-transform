@@ -13,3 +13,9 @@ class Settings(BaseSettings):
     metadata_root: str = "../secha-metadata"  # the secha-metadata checkout (the rulebook)
     landing_root: str = "data/landing"  # raw zone (Bronze), shared with secha-ingestion
     canonical_root: str = "data/canonical"  # Phase-1 local canonical parquet (Delta/UC comes later)
+
+    # --- Phase 3: Delta / Unity Catalog via Spark Connect (the 'spark' extra) ---
+    spark_url: str = ""  # e.g. sc://130.230.115.138:15772 (TUNI VPN required)
+    catalog_url: str = ""  # Unity Catalog API, e.g. http://130.230.115.140:8080
+    catalog_token: str = ""  # UC token; secret, .env only, never committed
+    staging_root: str = ""  # cluster-visible staging, e.g. /net/nfs/data/secha/canonical-staging
