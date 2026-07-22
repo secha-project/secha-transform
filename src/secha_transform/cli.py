@@ -216,7 +216,7 @@ def delta_load(
 
 @app.command("delta-views")
 def delta_views() -> None:
-    """Create/refresh the rulebook's serving views in Delta/Unity Catalog."""
+    """Publish the rulebook's derived catalog objects: reference dimensions + serving views."""
     transform_logging.configure()
     settings = Settings()
     bundle = _load_bundle_or_exit(settings, "mx_electrix")  # any vendor: target layer is shared
@@ -230,10 +230,14 @@ def delta_views() -> None:
         raise typer.Exit(code=1)
     delta = _delta_sink_or_exit(settings, bundle)
     try:
-        created = delta.create_serving_views(bundle, serving_dir)
+        # dimensions first: serving definitions may join them
+        dimensions = delta.create_reference_dimensions(bundle)
+        views = delta.create_serving_views(bundle, serving_dir)
     finally:
         delta.stop()
-    for name in created:
+    for name in dimensions:
+        typer.echo(f"dimension ready: {name}")
+    for name in views:
         typer.echo(f"view ready: {name}")
 
 

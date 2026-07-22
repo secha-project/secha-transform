@@ -174,6 +174,71 @@ def build_serving_table_ddl(
     return f"CREATE TABLE {qualified} (\n  {column_items}\n)\nUSING DELTA{properties_clause}"
 
 
+# Reference dimensions are published directly from the rulebook vocabularies (not from fact
+# data), so consumers JOIN the long fact for human-readable semantics + standards. This is the
+# correct home for per-quantity meaning in a LONG model and sidesteps the UC 0.4 column-comment
+# limitation (the descriptions are row values, always queryable, plus the dimension's own
+# columns carry real DDL comments where comments actually mean something).
+
+
+def _sql_literal(value: Any) -> str:
+    """A safe SQL string literal (or NULL); single quotes are doubled, never interpolated raw."""
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def resolve_vocabulary(bundle: MetadataBundle, source_vocabulary: str) -> dict[str, Any]:
+    """The rulebook vocabulary a reference dimension is published from; unknown names raise."""
+    if source_vocabulary == "quantities":
+        return dict(bundle.vocabulary.get("quantities", {}))
+    if source_vocabulary == "units":
+        return dict(bundle.units.get("units", {}))
+    raise ValueError(
+        f"reference dimension source_vocabulary '{source_vocabulary}' is not available"
+    )
+
+
+def dimension_rows(vocab: dict[str, Any], columns: list[dict[str, Any]]) -> list[list[Any]]:
+    """Ordered rows for a reference dimension; `from: __key__` is the dict key.
+
+    Keys are sorted so the published table is deterministic across runs.
+    """
+    rows: list[list[Any]] = []
+    for key in sorted(vocab):
+        entry = vocab[key]
+        rows.append(
+            [key if col["from"] == "__key__" else entry.get(col["from"]) for col in columns]
+        )
+    return rows
+
+
+def build_dimension_ddl(
+    qualified: str, columns: list[dict[str, Any]], table_properties: dict[str, Any]
+) -> str:
+    """CREATE TABLE DDL for a reference dimension (all STRING, with real column comments)."""
+    items = []
+    for col in columns:
+        comment = col.get("comment")
+        comment_clause = f" COMMENT {_sql_literal(comment)}" if comment else ""
+        items.append(f"{col['name']} STRING{comment_clause}")
+    column_items = ",\n  ".join(items)
+    property_items = ", ".join(f"'{key}' = '{value}'" for key, value in table_properties.items())
+    properties_clause = f"\nTBLPROPERTIES ({property_items})" if property_items else ""
+    return f"CREATE TABLE {qualified} (\n  {column_items}\n)\nUSING DELTA{properties_clause}"
+
+
+def build_dimension_insert(
+    qualified: str, columns: list[dict[str, Any]], rows: list[list[Any]]
+) -> str:
+    """INSERT INTO ... VALUES for a reference dimension; every value a safe SQL literal."""
+    column_names = ", ".join(col["name"] for col in columns)
+    value_tuples = ",\n  ".join(
+        "(" + ", ".join(_sql_literal(value) for value in row) + ")" for row in rows
+    )
+    return f"INSERT INTO {qualified} ({column_names}) VALUES\n  {value_tuples}"
+
+
 @dataclass(frozen=True)
 class MergeReport:
     """Counted outcome of one staged load; every number is user-visible."""
@@ -233,6 +298,29 @@ class DeltaSink:
             table_rows_before=before,
             table_rows_after=after,
         )
+
+    def create_reference_dimensions(self, bundle: MetadataBundle) -> list[str]:
+        """Publish every rulebook reference dimension as a Delta table; returns qualified names.
+
+        Uses only platform-proven primitives (drop, create with explicit DDL, insert-values),
+        so it works on the UC 0.4 connector that lacks views and RTAS.
+        """
+        target = bundle.target
+        catalog = target["catalog"]
+        properties = target.get("table_properties") or {}
+        created: list[str] = []
+        for name, decl in sorted((target.get("reference_dimensions") or {}).items()):
+            schema = decl.get("schema", target["schema"])
+            qualified = f"{catalog}.{schema}.{name}"
+            columns = decl["columns"]
+            rows = dimension_rows(resolve_vocabulary(bundle, decl["source_vocabulary"]), columns)
+            self._spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+            self._spark.sql(f"DROP TABLE IF EXISTS {qualified}")
+            self._spark.sql(build_dimension_ddl(qualified, columns, properties))
+            if rows:
+                self._spark.sql(build_dimension_insert(qualified, columns, rows))
+            created.append(qualified)
+        return created
 
     def create_serving_views(self, bundle: MetadataBundle, serving_dir: Path) -> list[str]:
         """Create/refresh every rulebook serving definition; returns the qualified names.

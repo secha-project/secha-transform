@@ -139,3 +139,27 @@ stopgap in use).
   two vendors, wide-JSON-API vs long-file-dump pipelines, one query, one shape. Detail:
   ProCem's first serving minute is exactly local midnight, matching the source file's
   Helsinki-local day boundary.
+
+## 2026-07-16, downstream feedback -> quantity dimension table
+
+Downstream user confirmed he can query columns via SQL, but column descriptions do not
+surface in the UC catalog UI, and even when comments are registered in UC, Spark SQL cannot
+read them (two documented UC 0.4 limitations: empty column metadata on Spark-created tables;
+comments not round-tripping Spark<->UC because Delta's log is the source of truth). Offered
+two options: the legacy Scala transformer's REST-payload comment fix, or "metadata as a table
+to query".
+
+Decision: the second option, and it is the architecturally correct one for a LONG fact. In a
+wide table each column is a measurement, so meaning must live in column comments (hence the
+legacy fix). In our long fact the columns are structural and the meaning lives in ROWS, i.e.
+in a DIMENSION. So we publish `secha.canonical.quantity` from `quantity_vocabulary.yaml`
+(quantity, default_unit, standard_ref, description); user JOINs the fact to it. This is
+config-driven, richer than a comment (carries standards refs), immune to the comment bug
+(row values are always queryable), and completes the star schema (fact + dimensions). We did
+NOT adopt the REST workaround: it belongs to the legacy transformer's manual UC registration,
+and UC 0.5 fixes the underlying bug upstream. Report: recommend the UC 0.5 upgrade.
+
+Implementation: `reference_dimensions` in `targets/canonical.yaml`; sink builders
+(`dimension_rows`, `build_dimension_ddl` with real column comments, `build_dimension_insert`
+with quote-escaping), all offline-tested; validator guard in secha-metadata (dangling
+attribute -> all-null column, rejected). `delta-views` publishes dimensions then serving views.

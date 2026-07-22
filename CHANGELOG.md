@@ -19,6 +19,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   or `table` for platforms whose catalog connector lacks view/RTAS abilities (this UC
   connector lacks both), refreshed via drop + explicit DDL from the analysed SELECT +
   insert-select, using only platform-proven primitives.
+- **Reference dimension tables** published from the rulebook vocabularies (`reference_dimensions`
+  in the target binding): `secha.canonical.quantity` (quantity, default_unit, standard_ref,
+  description) so downstream consumers JOIN the long fact for human-readable semantics and
+  standards, rather than relying on column comments (the correct home for meaning in a long
+  model, and it sidesteps the UC 0.4 comment limitation). Built with the same proven primitives
+  (drop + DDL-with-comments + insert-values, single quotes escaped). `delta-views` now publishes
+  dimensions then serving views. Deterministic (keys sorted); every builder offline-tested.
 - Settings + `.env.template`: `SECHA_SPARK_URL`, `SECHA_CATALOG_URL`, `SECHA_CATALOG_TOKEN`
   (secret), `SECHA_STAGING_ROOT`. The `spark` extra is now `pyspark-client==4.1.1`, pinned
   to the platform's Spark version.

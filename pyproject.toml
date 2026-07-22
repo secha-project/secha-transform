@@ -67,6 +67,15 @@ module = ["pyspark", "pyspark.*", "numpy", "numpy.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
+# pyarrow's stub coverage for pq.write_to_dataset varies by version (typed in some,
+# untyped in others), which under strict + warn_unused_ignores makes an inline
+# `# type: ignore` flip between required and unused across environments. Disabling the
+# untyped-call check for just the writer module is version-stable in either direction:
+# a disabled code that never fires is a harmless no-op, not an "unused" warning.
+[[tool.mypy.overrides]]
+module = ["secha_transform.io.writer"]
+disable_error_code = ["no-untyped-call"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]

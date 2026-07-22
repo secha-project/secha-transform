@@ -90,8 +90,10 @@ docs/         architecture diagram
   `delta.feature.catalogManaged`), reads cluster-visible staging parquet, dedupes on the merge key
   (latest `ingested_at` wins), and `MERGE`s on `measurement_id`. Serving definitions come from the
   rulebook's `serving/*.sql` (`{canonical}` placeholder), materialised per the target's
-  `serving_mode` (Delta snapshots here: this UC connector lacks views and RTAS).
-  CLI: `delta-load`, `delta-views`, and `--sink delta` on the vendor commands.
+  `serving_mode` (Delta snapshots here: this UC connector lacks views and RTAS). Reference
+  dimensions (e.g. `secha.canonical.quantity`) are published from the rulebook vocabularies so
+  consumers JOIN the long fact for descriptions + standards.
+  CLI: `delta-load`, `delta-views` (dimensions + serving), and `--sink delta` on the vendor commands.
   **Verified live:** `secha.canonical.measurement` holds 5,535,568 rows (both vendors; re-running
   the load reports `5535568 -> 5535568`, the platform-level idempotency proof) and
   `secha.serving.pq_minute_wide` answers the convergence query. Full record:
@@ -122,7 +124,7 @@ uv run secha-transform procem --date 2026-06-15                   # streams + ba
 
 # Phase 3 (needs the spark extra + .env platform values + TUNI VPN):
 uv run secha-transform delta-load --staging /net/nfs/data/secha/canonical-staging/load-001
-uv run secha-transform delta-views                                # rulebook serving/*.sql -> UC snapshots
+uv run secha-transform delta-views                                # publish reference dimensions + serving snapshots
 ```
 (No uv? `python -m venv .venv && .venv/Scripts/pip install -e . && .venv/Scripts/pip install pytest mypy ruff`,
 then run the same commands without the `uv run` prefix.)

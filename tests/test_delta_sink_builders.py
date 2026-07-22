@@ -12,10 +12,13 @@ import pytest
 from secha_transform.io.delta_sink import (
     build_create_schema_sql,
     build_create_table_sql,
+    build_dimension_ddl,
+    build_dimension_insert,
     build_merge_sql,
     build_serving_table_ddl,
     build_serving_view_sql,
     build_staged_projection_sql,
+    dimension_rows,
     full_table_name,
     serving_mode,
     spark_type_for,
@@ -177,3 +180,52 @@ def test_serving_without_serving_schema_raises() -> None:
 
 def test_full_table_name_comes_from_target_config() -> None:
     assert full_table_name(_bundle()) == "secha.canonical.measurement"
+
+
+# --- reference dimension builders (quantity dimension) ----------------------------------
+
+_DIM_COLUMNS = [
+    {"name": "quantity", "from": "__key__", "comment": "join key to measurement.quantity"},
+    {"name": "default_unit", "from": "default_unit", "comment": "canonical unit"},
+    {"name": "standard_ref", "from": "standard_ref"},
+    {"name": "description", "from": "description"},
+]
+_VOCAB = {
+    "voltage": {
+        "default_unit": "V",
+        "standard_ref": "IEC 61000-4-30",
+        "description": "RMS voltage",
+    },
+    "frequency": {"default_unit": "Hz", "standard_ref": "IEC ...", "description": "Freq's value"},
+}
+
+
+def test_dimension_rows_are_deterministic_and_keyed() -> None:
+    rows = dimension_rows(_VOCAB, _DIM_COLUMNS)
+    # sorted by key: frequency before voltage; __key__ column carries the key
+    assert rows[0][0] == "frequency" and rows[1][0] == "voltage"
+    assert rows[1] == ["voltage", "V", "IEC 61000-4-30", "RMS voltage"]
+
+
+def test_dimension_ddl_carries_column_comments_and_properties() -> None:
+    ddl = build_dimension_ddl("secha.canonical.quantity", _DIM_COLUMNS, TARGET["table_properties"])
+    assert ddl.startswith("CREATE TABLE secha.canonical.quantity")
+    assert "quantity STRING COMMENT 'join key to measurement.quantity'" in ddl
+    assert "standard_ref STRING," in ddl  # no comment declared -> no COMMENT clause
+    assert "USING DELTA" in ddl
+    assert "TBLPROPERTIES ('delta.feature.catalogManaged' = 'supported')" in ddl
+
+
+def test_dimension_insert_escapes_single_quotes() -> None:
+    """Descriptions can contain apostrophes; literals must be doubled, never interpolated raw."""
+    rows = dimension_rows(_VOCAB, _DIM_COLUMNS)
+    sql = build_dimension_insert("secha.canonical.quantity", _DIM_COLUMNS, rows)
+    assert sql.startswith("INSERT INTO secha.canonical.quantity (quantity, default_unit,")
+    assert "'Freq''s value'" in sql  # apostrophe doubled
+    assert "('voltage', 'V', 'IEC 61000-4-30', 'RMS voltage')" in sql
+
+
+def test_dimension_insert_nulls_missing_attributes() -> None:
+    rows = dimension_rows({"x": {"default_unit": "V"}}, _DIM_COLUMNS)
+    sql = build_dimension_insert("secha.canonical.quantity", _DIM_COLUMNS, rows)
+    assert "('x', 'V', NULL, NULL)" in sql  # absent standard_ref/description -> NULL, not ''
