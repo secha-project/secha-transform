@@ -74,6 +74,7 @@ src/secha_transform/
   config.py   pydantic-settings (env-prefixed SECHA_)
   cli.py      typer entrypoint (one subcommand per vendor; batching for huge days)
 tests/        golden per vendor (vs secha-metadata) + validation + IO + unit tests
+experiments/  research tooling, outside the CI-gated contract (see llm_codegen/)
 docs/         architecture diagram
 ```
 
@@ -117,6 +118,7 @@ are secrets; they are just paths.
 ```bash
 uv sync --dev
 uv run pytest                       # golden (needs secha-metadata) + self-contained unit tests
+uv run pytest experiments/llm_codegen/tests   # the LLM experiment's own tests (not run in CI)
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src
 uv run secha-transform mx-electrix --date 2025-08-15 --meter 21   # raw landing -> canonical parquet

@@ -11,3 +11,7 @@ htmlcov/
 .env
 # local canonical output (Phase 1 parquet stand-in for Delta/UC)
 data/canonical/
+# llm codegen experiment: cached model replies, frozen cases (they contain partner data) and results
+experiments/**/.cache/
+experiments/**/cases/
+experiments/**/results/

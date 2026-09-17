@@ -1,0 +1,204 @@
+# Findings: can a language model write the transformation code?
+
+Runs of 2026-09-15 (phi4-14b, kimi-k3) and 2026-09-17 (codestral-2508), all against engine
+`a0510a9`, rulebook `95de96b` and contract `325cc47c89a5`, on the same frozen cases. Each cell
+holds 5 samples at temperature 0.2, with one repair attempt using synthetic feedback. The
+method, and the corrections made to the harness during the runs, are in [README.md](README.md).
+
+| Model | Served by | Kind |
+|---|---|---|
+| `phi4-14b` | TUNI Aviary | small open-weight model, hosted by the university |
+| `moonshotai/kimi-k3` | NVIDIA NIM | large open-weight reasoning model |
+| `codestral-2508` | Mistral API | commercial code model |
+
+## Summary
+
+- **Both large models wrote a correct transformer for one vendor every time.** kimi-k3 and
+  codestral-2508 each got 10 of 10 programs exact on real data and edge cases, on the first
+  attempt.
+- **Every one of those programs broke when the configuration changed.** The 20 programs
+  survived 0 of 60 drift cases. This is the cost the framework removes: the engine follows an
+  edited rulebook with no new code.
+- **Rewriting the engine separated the models.** On the vendor shown, kimi-k3 was exact 10 of
+  10 times and codestral-2508 6 of 10. On the vendor not shown, they passed 4 of 10 and 3 of
+  10.
+- **kimi-k3's failures were mostly the contract's; codestral-2508's were its own.** Five of
+  kimi-k3's six failures on the unseen vendor trace to two sentences of our contract that left
+  a detail open. Every failing codestral-2508 program has a clear defect, most often that it
+  cannot process the source shape it was not shown.
+- **phi4-14b cannot do this task.** 1 of 20 programs passed on the vendor it was shown, none
+  passed on another vendor, and repair did not help.
+- **Mistral Medium did not run.** Mistral's free plan gives it a limit of zero requests.
+
+## Scores
+
+These are the strict scores from `python harness.py report --results results/phi4-14b
+results/kimi-k3 results/codestral-2508`. A pass means every row and every field equals the
+engine's output on every test input of the vendor shown: two real landing-zone inputs and one
+edge case.
+
+| Model | Mode | Rulebook shown | Pass, first attempt | Pass after repair | Row F1 | Stats exact | Identity hash | Pass on other vendor | Drift survival |
+|---|---|---|---|---|---|---|---|---|---|
+| kimi-k3 | snapshot | MX Electrix | 5 of 5 | 5 of 5 | 100% | 100% | 100% | not tested | 0% |
+| kimi-k3 | snapshot | ProCem | 5 of 5 | 5 of 5 | 100% | 100% | 100% | not tested | 0% |
+| kimi-k3 | interpreter | MX Electrix | 5 of 5 | 5 of 5 | 100% | 100% | 100% | 3 of 5 | 90% |
+| kimi-k3 | interpreter | ProCem | 5 of 5 | 5 of 5 | 100% | 100% | 100% | 1 of 5 | 60% |
+| codestral-2508 | snapshot | MX Electrix | 5 of 5 | 5 of 5 | 100% | 80% | 100% | not tested | 0% |
+| codestral-2508 | snapshot | ProCem | 5 of 5 | 5 of 5 | 100% | 80% | 100% | not tested | 0% |
+| codestral-2508 | interpreter | MX Electrix | 5 of 5 | 5 of 5 | 100% | 100% | 100% | 2 of 5 | 70% |
+| codestral-2508 | interpreter | ProCem | 1 of 5 | 1 of 5 | 40% | 60% | 20% | 1 of 5 | 27% |
+| phi4-14b | snapshot | MX Electrix | 0 of 5 | 0 of 5 | 0% | 0% | 0% | not tested | 0% |
+| phi4-14b | snapshot | ProCem | 0 of 5 | 0 of 5 | 10% | 0% | 0% | not tested | 0% |
+| phi4-14b | interpreter | MX Electrix | 0 of 5 | 0 of 5 | 34% | 0% | 0% | 0 of 5 | 10% |
+| phi4-14b | interpreter | ProCem | 1 of 5 | 1 of 5 | 20% | 40% | 0% | 0 of 5 | 10% |
+
+Row F1, stats and identity hash describe first attempts; the pass on the other vendor and drift
+survival describe each program after repair. After repair, phi4-14b's row F1 rose to 19% and
+14% in its two snapshot cells and to 35% for interpreter programs shown MX Electrix. No other
+cell changed.
+
+- kimi-k3 never needed its repair attempt. codestral-2508 used it on 6 of 20 samples, and
+  none of those repairs changed a pass.
+- In each snapshot cell, one codestral-2508 program emitted the right rows with wrong run
+  statistics.
+- The one phi4-14b program that passed wrote identity hashes that differ from the engine's, so
+  its rows could not be merged into the same table. The codestral-2508 interpreter that passed
+  on ProCem wrote the engine's identity hashes.
+- The median generation time was 21 to 40 seconds for codestral-2508, 22 to 41 seconds for
+  phi4-14b and 287 to 393 seconds for kimi-k3. kimi-k3's times include NVIDIA's queue: a probe
+  waited 270 seconds before the first byte of a one-line reply. They say nothing about the
+  model's speed.
+
+## How failures are classified
+
+This rule was written after three kimi-k3 failures had been diagnosed. Its scope was settled
+after an automatic list of every failure's type had been produced, and before any failure was
+classified or counted. codestral-2508 was run after the rule was written, and its failures were
+classified under it unchanged.
+
+The headline score is strict and is never adjusted. Separately, each sample that fails is
+examined, so a reader can see which failures belong to the model and which trace to the wording
+of the contract. A snapshot program failing a drift case is not examined: its configuration is
+written into it, so it cannot follow an edited rulebook, and that cost is what drift survival
+measures. Examining a sample stops at its first clear defect, because one defect settles that
+the sample fails for a reason of its own.
+
+A failure on one input is a **reading the contract permits** only when all three of these hold:
+
+1. It traces to one identified sentence of [CONTRACT.md](CONTRACT.md) that is silent on the
+   point or admits two readings.
+2. The program follows one of those readings consistently, on every input where the point
+   arises.
+3. With that point set aside, the program's output on the input equals the engine's. For a
+   program that crashes on the point, this is checked by changing only the code that handles
+   it and running the program again. The changed program is never scored.
+
+Anything else is a **defect**: a wrong value, a missing or extra row, a crash, a refused
+import, a timeout, or a reading the contract rules out. A sample passes *except for permitted
+readings* only when every one of its failures is a permitted reading. That count is reported
+beside the strict one, never instead of it.
+
+## What the classification found
+
+**phi4-14b: every failing sample has a clear defect, so nothing changes.** Each of its 20
+samples shows at least one of these:
+
+- a crash on a name it never defined, such as `mapping` or `ts_utc`;
+- a crash on a key that the other source shape does not have, such as `columns` or `src` on
+  ProCem's long-shape rulebook and `rows` or `key_field` on MX Electrix's wide one, or on a key
+  the contract makes optional, such as `shape` and `meter_field`
+  ([CONTRACT.md:121](CONTRACT.md:121), [CONTRACT.md:127](CONTRACT.md:127));
+- a crash on a missing key in its own written-in copy of the configuration;
+- timestamps with a UTC offset converted or rewritten, where the contract says they stay
+  unchanged ([CONTRACT.md:107](CONTRACT.md:107));
+- only a fraction of the expected rows, or none.
+
+**codestral-2508: every failing sample has a clear defect, so nothing changes.** All its
+failures are interpreter programs, eight in all:
+
+- six could not process the source shape they were not shown: five produced no rows for it,
+  and one raised an error naming it, although the contract describes both shapes
+  ([CONTRACT.md:127](CONTRACT.md:127));
+- one assumed a meter field that ProCem does not declare ([CONTRACT.md:96](CONTRACT.md:96));
+- four of the five shown ProCem also got ProCem itself wrong: epoch timestamps arriving as text
+  left empty ([CONTRACT.md:24](CONTRACT.md:24)), the three millisecond digits dropped
+  ([CONTRACT.md:110](CONTRACT.md:110)), or an unmapped record left uncounted
+  ([CONTRACT.md:132](CONTRACT.md:132)).
+
+**kimi-k3: five of its six failures on another vendor are permitted readings.**
+
+| Rulebook shown | Pass on other vendor, strict | Except permitted readings | Drift survival, strict | Except permitted readings |
+|---|---|---|---|---|
+| MX Electrix | 3 of 5 | 4 of 5 | 90% | 90% |
+| ProCem | 1 of 5 | 5 of 5 | 60% | 100% |
+
+The two sentences behind them:
+
+1. **An epoch written in scientific notation** ([CONTRACT.md:110](CONTRACT.md:110)). The
+   ProCem edge case includes the epoch `1.781470800e12`, the same number as `1781470800000`.
+   The contract says an `epoch_ms` value "is an integer number of milliseconds" and that "if it
+   is not an integer, `ts_utc` is null". The engine applies this to the text: the string is not
+   an integer, so the timestamp is null. One kimi-k3 program applied it to the number: the
+   value is whole, so it wrote the timestamp, while a value with a fraction would still have
+   been null. Both readings fit the sentence. The ProCem example in the prompt does show the
+   engine's reading, but this program was shown MX Electrix's example, which has no epoch
+   timestamps. Its output on the input was otherwise exact, statistics included.
+2. **The shape of `phase_map`** ([CONTRACT.md:148](CONTRACT.md:148)). MX Electrix generates
+   its harmonic columns from a `phase_map` written as a mapping from index to phase. The
+   contract says only "for each `(index, phase)` pair of its `phase_map` in declared order",
+   which does not say whether `phase_map` is a mapping or a list of pairs. ProCem's rulebook
+   has no generated rules, so a program shown only ProCem had nothing to copy. Four of five
+   kimi-k3 programs read it as a list of pairs and crashed on every MX Electrix input. With
+   only that one read changed to accept a mapping, each was exact on all six MX Electrix
+   inputs, drift cases and statistics included.
+
+The remaining kimi-k3 failure is a defect. That program accepted an epoch only when it
+arrived as a JSON integer, so it wrote an empty timestamp on every ProCem row. The contract
+says delimited sources arrive as strings that the program must interpret
+([CONTRACT.md:24](CONTRACT.md:24)).
+
+The contract was not revised during the experiment, and the strict scores stand. A revised
+contract for a later run would state both points.
+
+## What this means for the thesis
+
+- **Writing a transformer for one vendor is no longer the expensive part.** Two strong models,
+  one open-weight and one commercial, did it correctly every time, on the first attempt. The
+  expense is what follows: each change to the configuration made every one of those 20
+  programs wrong. A generated transformer has to be generated and verified again after every
+  edit, and verification needs an oracle, which here is the engine.
+- **Writing the engine is much harder, and that is where the models differ.** Handling a
+  vendor it has never seen needs a program that covers every rule the contract describes, not
+  only the ones in its example. codestral-2508 mostly wrote programs for the shape it was
+  shown; kimi-k3 covered both shapes and failed mainly where our contract left a detail open.
+- **A generated engine still needs the real one.** Where the best interpreters disagreed with
+  the engine, the cause was mostly a gap in the prose specification. The written contract did
+  not pin the behaviour; the engine's code and its cases did. Generating the engine therefore
+  does not remove the engine: checking the result needs one to test against.
+- **Capability decides whether this works at all.** The 14B model available at the university
+  was far from usable on this task.
+
+## Limitations
+
+- **One commercial model, and not the mapping benchmark's.** Mistral's free plan gives Mistral
+  Medium, the commercial model of the mapping benchmark, a limit of zero requests, so the
+  commercial arm is codestral-2508, Mistral's code model. The two steps do not share a
+  commercial model.
+- **Small samples.** Five samples per cell move a rate in steps of 20 points, and pass@k is
+  estimated from those five.
+- **Few inputs.** Each vendor has two real inputs, one edge case and three drift edits. A
+  program can pass all of them and still be wrong on inputs they do not cover.
+- **We wrote the contract.** It was written from the engine's documentation and frozen before
+  any model output was seen, and two gaps were found in it. A different author would leave
+  different gaps.
+- **The classification rule came after some failures were seen.** Three kimi-k3 failures had
+  been diagnosed before it was written, as stated above. It is applied to all three models
+  alike, codestral-2508 was run after it was written, and it never changes the strict scores.
+- **Different days.** codestral-2508 ran two days after the other two, against the same engine,
+  rulebook, contract and cases, with the same prompts, sandbox and scoring. In between, the
+  client began recording the model name each provider reports serving, and the report began
+  counting missing and extra rows.
+- **Hosted models are not reproducible by generation.** NVIDIA retired another model in this
+  study on 2026-09-14, and Mistral's limit for Medium dropped to zero within two weeks of a
+  successful probe. Cached replies re-score exactly; new replies from the same weights cannot
+  be guaranteed. Mistral reported serving `codestral-2508` for all 26 of its replies.

@@ -4,6 +4,18 @@ All notable changes to `secha-transform` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added (experiment: generated transformers scored against the engine)
+- `experiments/llm_codegen/`: asks a language model for a transformation program, runs it in a
+  sandbox, and scores its output row by row against the engine's output on the same input. Two
+  modes (one vendor's configuration written into the program, or the rulebook read at run
+  time), frozen test and drift cases, 5 samples per cell, one repair from synthetic feedback
+  only. Outside the CI-gated package; its tests need no network.
+- The harness separates provider failures from model failures, streams NVIDIA replies past its
+  300-second gateway limit, and keeps repair prompts byte-identical across runs.
+- Every reply records the model name the provider reports serving.
+- Results for `phi4-14b` (TUNI Aviary), `moonshotai/kimi-k3` (NVIDIA NIM) and `codestral-2508`
+  (Mistral, the commercial arm) in `experiments/llm_codegen/findings.md`. `mistral-medium-2604`
+  did not run, because Mistral's free plan gives it a limit of zero requests.
 ### Added (Phase 3, Step 2: the Delta / Unity Catalog sink)
 - `io/delta_sink.py`: pure SQL builders (offline-tested) + a thin Spark Connect wrapper.
   Table DDL is GENERATED from `canonical_schema.yaml` and the target binding, including the

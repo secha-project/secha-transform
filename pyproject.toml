@@ -48,6 +48,7 @@ ignore = ["ANN401"]  # `Any` is legitimate at the YAML / fsspec / raw-record bou
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ANN"]
+"experiments/**/tests/**" = ["ANN"]
 
 [tool.mypy]
 python_version = "3.11"
