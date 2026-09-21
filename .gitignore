@@ -15,3 +15,5 @@ data/canonical/
 experiments/**/.cache/
 experiments/**/cases/
 experiments/**/results/
+# canonical_sample.py: workbooks generated for a review, sent by mail, not committed
+review/

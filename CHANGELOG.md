@@ -16,6 +16,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 - Results for `phi4-14b` (TUNI Aviary), `moonshotai/kimi-k3` (NVIDIA NIM) and `codestral-2508`
   (Mistral, the commercial arm) in `experiments/llm_codegen/findings.md`. `mistral-medium-2604`
   did not run, because Mistral's free plan gives it a limit of zero requests.
+### Added (reporting: `scripts/canonical_sample.py`)
+- Exports a real sample of canonical output as one workbook: the rows themselves, the same
+  rows through `serving/pq_minute_wide.sql` (executed in SQLite, with `date_trunc`
+  substituted and the substitution recorded in the workbook), the run statistics, and the
+  field and vocabulary dictionaries. Built for the power quality review, where a long fact
+  table is easier shown than described. Needs `openpyxl`, which the engine does not.
 ### Added (Phase 3, Step 2: the Delta / Unity Catalog sink)
 - `io/delta_sink.py`: pure SQL builders (offline-tested) + a thin Spark Connect wrapper.
   Table DDL is GENERATED from `canonical_schema.yaml` and the target binding, including the

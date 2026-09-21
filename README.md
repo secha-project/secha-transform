@@ -75,6 +75,7 @@ src/secha_transform/
   cli.py      typer entrypoint (one subcommand per vendor; batching for huge days)
 tests/        golden per vendor (vs secha-metadata) + validation + IO + unit tests
 experiments/  research tooling, outside the CI-gated contract (see llm_codegen/)
+scripts/      reporting and platform helpers (canonical_sample.py, phase3/)
 docs/         architecture diagram
 ```
 
@@ -138,6 +139,22 @@ then run the same commands without the `uv run` prefix.)
 
 The golden tests read the contract from `SECHA_METADATA_ROOT` (defaults to the sibling `secha-metadata`
 checkout); the unit tests need nothing external.
+
+## Showing the output to a reader
+
+`scripts/canonical_sample.py` runs the engine over a minute of landed data per vendor and
+writes one workbook: the canonical rows, the same rows through `serving/pq_minute_wide.sql`,
+the run statistics, and the field and vocabulary dictionaries. Nothing in it is written by hand,
+so it shows what the engine does today rather than what a document once claimed.
+
+```bash
+uv pip install openpyxl                                 # a reporting need, not an engine one
+python scripts/canonical_sample.py --out ../review
+```
+
+The sample holds real readings, so the workbook states on its first sheet that it is
+project-internal. The wide sheet is produced by executing the rulebook's SELECT in SQLite, with
+`date_trunc` replaced by an equivalent expression, and the workbook records that substitution.
 
 ## Adding a new vendor
 No engine change. Add the vendor's config in `secha-metadata` (source schema, mapping, validation) and,
