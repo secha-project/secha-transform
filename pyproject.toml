@@ -41,6 +41,9 @@ packages = ["src/secha_transform"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# CI checks secha-metadata out inside this workspace for the golden tests. That repo
+# lints and formats itself; its style must not decide whether this one passes.
+extend-exclude = ["secha-metadata-checkout"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "RUF"]
