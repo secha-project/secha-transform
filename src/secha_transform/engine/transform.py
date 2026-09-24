@@ -5,6 +5,12 @@ Pure function. No vendor logic; it only interprets the metadata bundle. Wide sou
 resolved via `rows:` keyed on the record's key-field value. The vendor's validation rules are
 applied (flag/drop/reject, all counted); same input + same config gives identical output (apart
 from the runtime `ingested_at` stamp).
+
+Sources organised by charging session declare a `session:` block: every row then carries its
+session id and its offset in seconds from the session start, and each distinct session also
+yields one `charging_session` row, built from the canonical schema's own field list. A source
+with no row key declares `record.row_id_from: payload_position`, and the row's place in its
+landed payload (stamped by the reader) becomes its row id.
 """
 
 from __future__ import annotations
@@ -14,7 +20,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from secha_transform.engine.identity import measurement_id
-from secha_transform.engine.models import CanonicalRow, TransformResult, TransformStats
+from secha_transform.engine.models import (
+    PAYLOAD_POSITION_FIELD,
+    CanonicalRow,
+    TransformResult,
+    TransformStats,
+)
 from secha_transform.engine.validation import parse_rules
 from secha_transform.metadata.loader import MetadataBundle
 
@@ -95,6 +106,25 @@ def _apply_transform(col: dict[str, Any], raw: Any, factors: Mapping[str, float]
     raise ValueError(f"transform '{transform}' is not implemented by this engine")
 
 
+def entity_fields(bundle: MetadataBundle, entity: str) -> list[tuple[str, str]]:
+    """(name, type) of a canonical entity's fields, in schema order."""
+    fields = bundle.canonical["entities"][entity]["fields"]
+    return [(str(f["name"]), str(f["type"])) for f in fields]
+
+
+def _coerce(value: Any, field_type: str) -> Any:
+    """A source value as the canonical field type; unknown types raise, never guess."""
+    if value is None:
+        return None
+    if field_type in ("int", "long"):
+        return int(value)
+    if field_type == "double":
+        return float(value)
+    if field_type == "string" or field_type.startswith(("enum:", "vocab:", "registry:")):
+        return str(value)
+    raise ValueError(f"canonical field type '{field_type}' has no engine coercion")
+
+
 def transform_records(
     records: Iterable[dict[str, Any]],
     bundle: MetadataBundle,
@@ -111,6 +141,18 @@ def transform_records(
     meter_field = record_cfg.get("meter_field")  # optional: long sources have no meter concept
     ts_field = record_cfg.get("timestamp_field", "timestamp")
     row_id_field = record_cfg.get("row_id_field", "id")
+    row_id_from = record_cfg.get("row_id_from")
+    if row_id_from not in (None, "payload_position"):
+        raise ValueError(f"record.row_id_from '{row_id_from}' is not implemented by this engine")
+
+    session_cfg = source.get("session") or {}
+    session_id_field = session_cfg.get("id_field")
+    session_offset_field = session_cfg.get("offset_field")
+    session_attributes: dict[str, str] = session_cfg.get("attributes") or {}
+    session_fields = entity_fields(bundle, "charging_session") if session_id_field else []
+    unknown = set(session_attributes) - {name for name, _ in session_fields}
+    if unknown:
+        raise ValueError(f"session attributes {sorted(unknown)} are not charging_session fields")
     default_template = (
         f"{bundle.vendor}:meter:{{{meter_field}}}" if meter_field else f"{bundle.vendor}:device"
     )
@@ -133,6 +175,7 @@ def transform_records(
     ingested_at = _now_iso()  # one stamp per run: rows of a batch share their provenance instant
 
     rows: list[CanonicalRow] = []
+    sessions: dict[str, dict[str, Any]] = {}
     for record in records:
         stats.records_in += 1
 
@@ -154,8 +197,26 @@ def transform_records(
         meter = str(record[meter_field]) if meter_field else None
         device_id = device_template.format(**record)
         ts_utc = _to_utc(record.get(ts_field), datetime_format)
-        raw_row_id = record.get(row_id_field)
-        source_row_id = None if raw_row_id is None else str(raw_row_id)
+        if row_id_from == "payload_position":
+            position = record.get(PAYLOAD_POSITION_FIELD)
+            if position is None:
+                # without it every reading of a quantity would share one identity
+                raise ValueError(
+                    "record.row_id_from is payload_position, but a record has no position; "
+                    "read records through secha_transform.io.reader"
+                )
+            source_row_id: str | None = str(position)
+        else:
+            raw_row_id = record.get(row_id_field)
+            source_row_id = None if raw_row_id is None else str(raw_row_id)
+        session_id: str | None = None
+        offset_s: int | None = None
+        if session_id_field:
+            raw_session = record.get(session_id_field)
+            if raw_session is not None:
+                session_id = f"{bundle.vendor}:session:{raw_session}"
+            raw_offset = record.get(session_offset_field) if session_offset_field else None
+            offset_s = None if raw_offset is None else int(raw_offset)
         factors = factors_by_meter.get(meter, {}) if meter is not None else {}
 
         emitted: list[_Emitted] = []
@@ -199,7 +260,7 @@ def transform_records(
                         None,
                         col["unit"],
                         value,
-                        aggregation,
+                        col.get("aggregation", aggregation),
                     )
                 )
             for gen in mapping.get("generated", []):
@@ -274,6 +335,8 @@ def transform_records(
                     source_row_id=source_row_id,
                     schema_version=schema_version,
                     ingested_at=ingested_at,
+                    session_id=session_id,
+                    ts_session_offset_s=offset_s,
                 )
             )
         if record_rejected:
@@ -281,6 +344,17 @@ def transform_records(
             stats.rows_suspect -= sum(1 for r in record_rows if r.quality == "suspect")
             continue
         rows.extend(record_rows)
+        if session_id is not None and session_id not in sessions:
+            # attribute (a charging_session field) -> the source column that fills it
+            values: dict[str, Any] = {
+                attribute: record.get(column) for attribute, column in session_attributes.items()
+            }
+            values.update(
+                session_id=session_id, source_vendor=bundle.vendor, schema_version=schema_version
+            )
+            sessions[session_id] = {
+                name: _coerce(values.get(name), field_type) for name, field_type in session_fields
+            }
 
     stats.rows_emitted = len(rows)
-    return TransformResult(rows=rows, stats=stats)
+    return TransformResult(rows=rows, stats=stats, sessions=list(sessions.values()))

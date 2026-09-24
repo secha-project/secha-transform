@@ -2,9 +2,17 @@
 
 Reads only, never transforms. The vendor's source schema drives everything: the access
 descriptor (`access.layout`) resolves partitions, the format descriptor (`format:`) selects
-the parser (JSON arrays/objects, or header-less DSV whose values stay strings; value
-interpretation is the engine's job). A declared format the reader cannot honour raises.
-Records stream lazily so multi-million-row days never sit in memory at once.
+the parser (JSON arrays/objects, header-less DSV whose values stay strings, or Parquet,
+whose values arrive typed; value interpretation is the engine's job). A declared format the
+reader cannot honour raises. Records stream lazily so multi-million-row inputs never sit in
+memory at once.
+
+A layout names its partitions with placeholders (`date={date}/meter={meter}`,
+`export={export}/part={part}`). A caller selects partitions by giving some placeholder
+values; the rest match any value. For a source with no row key
+(`record.row_id_from: payload_position`) each record is stamped with its partition and its
+index in the payload, which the engine uses as the row id: the payload is immutable once
+landed, so the position is stable.
 
 Mirrors the secha-ingestion landing layout: partitions hold `<sha16>.<ext>` payloads plus
 `.meta.json` envelope sidecars; multiple payloads in one partition are snapshots, of which
@@ -15,12 +23,47 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import fsspec
+import pyarrow.parquet as pq
 
+from secha_transform.engine.models import PAYLOAD_POSITION_FIELD
 from secha_transform.metadata.loader import MetadataBundle
+
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
+_PARQUET_BATCH_ROWS = 65_536  # rows per Arrow batch: bounded memory, few Python round trips
+
+
+def layout_keys(layout: str) -> list[str]:
+    """The placeholders of an access layout, in order ('date={date}/meter={meter}' -> both)."""
+    return _PLACEHOLDER.findall(layout)
+
+
+def _layout_regex(layout: str) -> re.Pattern[str]:
+    """A pattern matching a partition path of the layout, capturing each placeholder."""
+    pieces = _PLACEHOLDER.split(layout)  # literal, key, literal, key, ..., literal
+    parts = [
+        re.escape(piece) if index % 2 == 0 else f"(?P<{piece}>[^/]+)"
+        for index, piece in enumerate(pieces)
+    ]
+    return re.compile("(?:^|/)" + "".join(parts) + "$")
+
+
+@dataclass(frozen=True)
+class Partition:
+    """One landing partition: its placeholder values and its directory."""
+
+    values: dict[str, str]
+    directory: str
+
+    @property
+    def identity(self) -> str:
+        """The partition as `key=value` pairs in layout order, e.g. `export=…/part=…`."""
+        return "/".join(f"{key}={value}" for key, value in self.values.items())
 
 
 def _latest_payload(fs: Any, directory: str) -> str | None:
@@ -75,18 +118,24 @@ def parse_dsv_records(body: bytes, source_schema: dict[str, Any]) -> Iterator[di
         yield dict(zip(names, parts, strict=True))
 
 
-def _read_partition_records(
+def _read_payload_records(
     fs: Any, directory: str, source_schema: dict[str, Any]
 ) -> Iterator[dict[str, Any]]:
     path = _latest_payload(fs, directory)
     if path is None:
         return
+    fmt = source_schema.get("format", {})
+    fmt_type = fmt.get("type", "json")
+    if fmt_type == "parquet":
+        # streamed batch by batch; values arrive typed, as the export declared them
+        with fs.open(path, "rb") as handle:
+            for batch in pq.ParquetFile(handle).iter_batches(batch_size=_PARQUET_BATCH_ROWS):
+                yield from batch.to_pylist()
+        return
     with fs.open(path, "rb") as handle:
         # bytes + explicit UTF-8 default: text mode would use the platform encoding
         # (cp1252 on Windows) and misdecode e.g. Finnish characters in the raw payload
         body = handle.read()
-    fmt = source_schema.get("format", {})
-    fmt_type = fmt.get("type", "json")
     if fmt_type == "json":
         data = json.loads(body.decode(fmt.get("encoding", "utf-8")))
         if isinstance(data, list):
@@ -100,23 +149,70 @@ def _read_partition_records(
     raise ValueError(f"format type '{fmt_type}' is not implemented by this engine")
 
 
-def read_records(
-    landing_root: str, source_schema: dict[str, Any], date: str, meter: str | None = None
-) -> Iterator[dict[str, Any]]:
-    """Yield one date's raw records, per the source schema's access + format descriptors."""
+def iter_partitions(
+    landing_root: str, source_schema: dict[str, Any], **selection: str | None
+) -> Iterator[Partition]:
+    """The landing partitions the selection names, in sorted order.
+
+    `selection` gives values for some of the layout's placeholders; a placeholder left out
+    (or given as None) matches any value. A key the layout does not have raises.
+    """
     fs, base = fsspec.core.url_to_fs(landing_root)
     root = str(base).rstrip("/")
     layout: str = source_schema["access"]["layout"]
-    if "{meter}" in layout:
-        if meter is None:
-            pattern = layout.format(date=date, meter="*")
-            partitions = sorted(str(path) for path in fs.glob(f"{root}/{pattern}"))
-        else:
-            partitions = [f"{root}/{layout.format(date=date, meter=meter)}"]
+    keys = layout_keys(layout)
+    unknown = sorted(set(selection) - set(keys))
+    if unknown:
+        raise ValueError(f"layout {layout!r} has no placeholder(s) {unknown}; it has {keys}")
+    chosen = {key: value for key, value in selection.items() if value is not None}
+    pattern = layout.format(**{key: chosen.get(key, "*") for key in keys})
+    if len(chosen) == len(keys):
+        candidate = f"{root}/{pattern}"  # fully specified: no listing needed
+        directories = [candidate] if fs.isdir(candidate) else []
     else:
-        partitions = [f"{root}/{layout.format(date=date)}"]
-    for partition in partitions:
-        yield from _read_partition_records(fs, partition, source_schema)
+        directories = sorted(
+            str(path) for path in fs.glob(f"{root}/{pattern}") if fs.isdir(str(path))
+        )
+    matcher = _layout_regex(layout)
+    for directory in directories:
+        found = matcher.search(directory.replace("\\", "/"))
+        values = {key: found.group(key) if found else chosen[key] for key in keys}
+        yield Partition(values=values, directory=directory)
+
+
+def read_partition(
+    landing_root: str, partition: Partition, source_schema: dict[str, Any]
+) -> Iterator[dict[str, Any]]:
+    """Yield one partition's raw records; stamp each with its position when the source
+    declares `record.row_id_from: payload_position`."""
+    fs, _ = fsspec.core.url_to_fs(landing_root)
+    records = _read_payload_records(fs, partition.directory, source_schema)
+    if (source_schema.get("record") or {}).get("row_id_from") != "payload_position":
+        yield from records
+        return
+    for index, record in enumerate(records):
+        record[PAYLOAD_POSITION_FIELD] = f"{partition.identity}:{index}"
+        yield record
+
+
+def read_records(
+    landing_root: str,
+    source_schema: dict[str, Any],
+    date: str | None = None,
+    meter: str | None = None,
+    **selection: str | None,
+) -> Iterator[dict[str, Any]]:
+    """Yield the raw records of every selected partition, per the source schema.
+
+    `date` and `meter` are the placeholders the first two vendors' layouts use; any other
+    placeholder is selected by keyword. Unselected placeholders match every partition.
+    """
+    if date is not None:
+        selection["date"] = date
+    if meter is not None:
+        selection["meter"] = meter
+    for partition in iter_partitions(landing_root, source_schema, **selection):
+        yield from read_partition(landing_root, partition, source_schema)
 
 
 def read_device_factors(

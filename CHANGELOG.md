@@ -4,6 +4,41 @@ All notable changes to `secha-transform` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
+### Added (vendor #3, Kempower: generic capabilities, no vendor logic)
+- **Parquet payloads** (`format.type: parquet`): the reader streams Arrow batches, values
+  arriving typed as the export declared them.
+- **Any layout placeholders**: `access.layout` may use any `{key}`; a caller selects some keys
+  and the rest match every landed value (`iter_partitions`, `read_partition`). `read_records`
+  keeps its `date`/`meter` arguments and takes any other key by keyword.
+- **Positional row ids** (`record.row_id_from: payload_position`): for a source with no row
+  key, the reader stamps each record with its partition and its index in the immutable landed
+  payload, and the engine uses that as `source_row_id`. The merge key is unchanged, so no
+  existing `measurement_id` moves.
+- **Sessions** (`session:` block): every row carries `session_id` (namespaced by vendor) and
+  `ts_session_offset_s`; each distinct session yields one `charging_session` row, typed from the
+  canonical schema's field list (`TransformResult.sessions`).
+- **Per-column aggregation** on wide `columns:` entries, as long `rows:` entries already had.
+- CLI `secha-transform run <vendor> [--select key=value]`: any vendor whose values need no
+  device factors from a second source, from its metadata alone. It streams each partition in
+  batches, names its output after the partition (idempotent re-runs), writes each session once
+  per partition, and reports progress per partition. Setting `SECHA_DIMENSIONS_ROOT` for the
+  other canonical entities.
+- Golden test for the Kempower contract in `secha-metadata` (synthetic fixture, run through the
+  real Parquet read path), unit tests for each capability, and an end-to-end CLI test.
+### Fixed
+- Rows without clock time get a null `event_date`, stored in Hive's default partition. The
+  writer used the string `"unknown"`, which the Delta table's DATE column would reject under
+  Spark's ANSI casts.
+- Every output file has one explicit schema derived from `CanonicalRow`. Types were inferred
+  per batch, so a batch with `ts_utc` null throughout typed it `null` in one file and `string`
+  in another, which a reader of the whole dataset cannot reconcile. The datasets' partitioning
+  is declared for readers too (`MEASUREMENT_PARTITIONING`, `ENTITY_PARTITIONING`), because
+  inference fails outright on a dataset whose only `event_date` is null.
+### Changed
+- The writer builds Arrow columns straight from the rows, and `CanonicalRow.to_dict()` reads its
+  fields shallowly instead of calling `dataclasses.asdict`, which deep-copies. Profiling a
+  100,000-record batch put `asdict` at over half the run time; the output is identical (checked
+  on 500,000 rows) and writing a batch fell to 2.5 s.
 ### Added (experiment: generated transformers scored against the engine)
 - `experiments/llm_codegen/`: asks a language model for a transformation program, runs it in a
   sandbox, and scores its output row by row against the engine's output on the same input. Two

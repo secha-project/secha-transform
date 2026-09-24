@@ -5,7 +5,8 @@
 `secha-transform` reads **raw** data (from the `secha-ingestion` landing zone) plus the **rulebook**
 (`secha-metadata`) and produces **canonical** rows. It is a *deterministic interpreter of metadata*:
 **no vendor logic lives in the engine**. Swap a config, get different output, zero code change. That
-decoupling is the central interoperability claim of the thesis, demonstrated with two vendors.
+decoupling is the central interoperability claim of the thesis, demonstrated with two vendors end to
+end, and tested on a third, Kempower, which needed new generic capabilities but no vendor logic.
 
 ## Architecture at a glance
 
@@ -35,6 +36,13 @@ canonical row is self-describing: `quantity · phase · variant · harmonic_orde
 tagged with its source provenance and a deterministic `measurement_id`. The same physical thing
 always takes the same row shape across vendors, which is what makes the data interoperable.
 
+**Session sources:** a wide source whose rows belong to charging sessions and carry no clock time
+(Kempower: 10-second steps of each session). Every row gets its `session_id` and its
+`ts_session_offset_s`; `ts_utc` stays null, and so does `event_date`, stored in Hive's default
+partition. Each distinct session also yields one `charging_session` row, built from the canonical
+schema's own field list. With no row key in the source, a row's identity is its position in the
+immutable landed Parquet part (`record.row_id_from: payload_position`).
+
 **On the canonical shape (long vs wide).** Only `quantity` (with `value` and `unit`) carries meaning for
 most variables. `phase` and `variant` sit at `none` and `harmonic_order` is `null` unless the row is a
 phase-resolved or harmonic power-quality reading, so non-PQ data (a battery state-of-charge, a price)
@@ -42,7 +50,7 @@ only sets `quantity`. The long form is the **interoperability substrate**, not w
 Phase 3 builds **wide serving views** (one column per quantity) shaped per use case, so analysts get a
 friendly wide table while the long form does the flexible plumbing underneath.
 
-## Proven end-to-end (two vendors, one canonical table)
+## Proven end-to-end (two vendors in one canonical table, a third transformed)
 - **MX Electrix** (wide JSON API): a full real day, **1,440 one-minute records → ~36,000 canonical
   rows** (unpivot fan-out).
 - **ProCem Kampusareena** (long 1 Hz file triples): a full real day, **14,476,804 records →
@@ -51,8 +59,13 @@ friendly wide table while the long form does the flexible plumbing underneath.
 - **The convergence query**: one filter (`quantity=voltage, phase=L1`) returns both vendors in
   identical shape: `mx_electrix:meter:21 → 237.20 V` and `procem:kampusareena:evcharging →
   234.57 V`, same columns, same semantics. That single result is the interoperability claim, live.
+- **Kempower** (wide Parquet, charging sessions, no clock time), transformed locally: all 99
+  landed parts, **71,793,566 records -> 358,967,830 canonical rows** and 396,848 charging
+  sessions in 2.3 h; reconciled against the raw parts independently (rows = non-empty cells per
+  quantity, value sums equal, the 709 suspect readings = the export's 709 negative voltages).
+  Not yet loaded into Unity Catalog.
 - Golden tests assert the engine reproduces the exact canonical rows defined by the
-  `secha-metadata` contract for **both** vendors.
+  `secha-metadata` contract for **all three** vendors.
 
 ## Principles
 - **Deterministic & pure.** `transform_records(records, bundle, factors)` is a pure function;
@@ -110,6 +123,7 @@ are secrets; they are just paths.
 | `SECHA_METADATA_ROOT` | `../secha-metadata` | the rulebook checkout the engine interprets |
 | `SECHA_LANDING_ROOT` | `data/landing` | raw zone (usually `../secha-ingestion/data/landing`) |
 | `SECHA_CANONICAL_ROOT` | `data/canonical` | Phase-1 local canonical parquet output |
+| `SECHA_DIMENSIONS_ROOT` | `data/canonical-dimensions` | other canonical entities, one dataset each (e.g. `charging_session/`) |
 | `SECHA_SPARK_URL` | unset | Phase 3: Spark Connect endpoint (TUNI VPN) |
 | `SECHA_CATALOG_URL` | unset | Phase 3: Unity Catalog API |
 | `SECHA_CATALOG_TOKEN` | unset | Phase 3: UC token (secret; `.env` only) |
@@ -124,6 +138,8 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy src
 uv run secha-transform mx-electrix --date 2025-08-15 --meter 21   # raw landing -> canonical parquet
 uv run secha-transform procem --date 2026-06-15                   # streams + batches 14.5M records
+uv run secha-transform run kempower                               # any vendor, from its metadata alone
+uv run secha-transform run kempower --select part=00000-c000      # one partition (layout key=value)
 
 # Phase 3 (needs the spark extra + .env platform values + TUNI VPN):
 uv run secha-transform delta-load --staging /net/nfs/data/secha/canonical-staging/load-001
@@ -132,10 +148,16 @@ uv run secha-transform delta-views                                # publish refe
 (No uv? `python -m venv .venv && .venv/Scripts/pip install -e . && .venv/Scripts/pip install pytest mypy ruff`,
 then run the same commands without the `uv run` prefix.)
 
-> A run only transforms what `secha-ingestion` has already **landed** for that date/meter. If nothing is
-> landed you get `Transformed 0 record(s)`; land the day first with `secha-ingest`. Re-running the same
-> date/meter **replaces** that run's output (run-scoped part files); when a partition holds several landed
-> snapshots, the reader uses only the **latest** one (by the envelope's `fetched_at`).
+> A run only transforms what `secha-ingestion` has already **landed** for the selected partitions. If
+> nothing is landed you get `Transformed 0 record(s)` (or, with `run`, a clear refusal); land the data
+> first with `secha-ingest`. Re-running the same partitions **replaces** that run's output (run-scoped
+> part files); when a partition holds several landed snapshots, the reader uses only the **latest** one
+> (by the envelope's `fetched_at`).
+
+Every output file has the same explicit schema, whatever nulls a batch holds, and the datasets are
+read with the partitioning the writer declares (`MEASUREMENT_PARTITIONING`, `ENTITY_PARTITIONING`
+in `io/writer.py`): a dataset holding only rows without clock time has no non-null `event_date` for
+inference to type, and pyarrow's inference then fails.
 
 The golden tests read the contract from `SECHA_METADATA_ROOT` (defaults to the sibling `secha-metadata`
 checkout); the unit tests need nothing external.
@@ -157,21 +179,28 @@ project-internal. The wide sheet is produced by executing the rulebook's SELECT 
 `date_trunc` replaced by an equivalent expression, and the workbook records that substitution.
 
 ## Adding a new vendor
-No engine change. Add the vendor's config in `secha-metadata` (source schema, mapping, validation) and,
-if needed, a CLI subcommand here. The engine already interprets any well-formed bundle, wide or long.
-That "new vendor = config, not code" property is the transform-side proof of the framework's
-decoupling claim; the ProCem onboarding demonstrated it with three generic engine capabilities and
-zero vendor logic (measured in `secha-metadata`'s `docs/onboarding-diary-procem.md`).
+No vendor logic, and no CLI change: add the vendor's config in `secha-metadata` (source schema,
+mapping, validation) and run it with `secha-transform run <vendor>`. The engine interprets any
+well-formed bundle, wide or long, dated or session-based. A source unlike any before may first need
+a **generic** capability: ProCem needed three (long records, epoch timestamps, descriptor-driven
+reading) and Kempower five (Parquet, any layout placeholders, a positional row id, sessions with
+`charging_session` rows, and rows without a date, plus per-column aggregation). Neither added a
+line of vendor logic; the costs are measured in `secha-metadata`'s onboarding diaries.
 
 ## Status / open items
-- **Scope:** two vendors, MX Electrix (wide JSON) and ProCem Kampusareena (long DSV triples).
-  Primitives implemented: unpivot (wide), **keyed `rows:` lookup (long)** with per-row aggregation
-  override, `none`, `scale_by_factor`, `parse_decimal`, timestamps (`iso8601`, **`epoch_ms`/`epoch_s`**
-  with exact integer math), descriptor-driven reading (`access.layout` + `format:` incl. header-less
-  DSV), latest-snapshot selection, streaming/batched processing for multi-million-row days, and
-  **validation application** (flag/drop/reject with counted run stats). Unimplemented transforms,
-  formats, and rules fail loudly. `grep -ril procem src/` matches only the CLI command wiring;
-  the engine and IO layers contain zero vendor logic.
+- **Scope:** three vendors: MX Electrix (wide JSON), ProCem Kampusareena (long DSV triples) and
+  Kempower (wide Parquet, charging sessions, no clock time).
+  Primitives implemented: unpivot (wide), **keyed `rows:` lookup (long)** with per-row and
+  per-column aggregation overrides, `none`, `scale_by_factor`, `parse_decimal`, timestamps
+  (`iso8601`, **`epoch_ms`/`epoch_s`** with exact integer math), descriptor-driven reading
+  (`access.layout` with any placeholders + `format:` incl. header-less DSV and **Parquet**),
+  latest-snapshot selection, positional row ids, **sessions** with `charging_session` rows, rows
+  without a date, streaming/batched processing, and **validation application** (flag/drop/reject
+  with counted run stats). Unimplemented transforms, formats, and rules fail loudly. No vendor
+  name appears in the engine or IO layers; the CLI names only the first two vendors' own commands.
+- **Kempower in Unity Catalog is the next step.** The local canonical output exists; loading it
+  needs a Spark-side check that the null `event_date` partition reads as null, and a MERGE for the
+  `charging_session` table, which the sink does not have yet.
 - **Phase 3 is live.** Operational notes: platform commands need the TUNI VPN + a Unity Catalog token
   in `.env`; staged canonical parquet must sit on the cluster NFS (`/net/nfs`); serving snapshots are
   refreshed by re-running `delta-views` after each `delta-load`. Platform runbook + facts learned:

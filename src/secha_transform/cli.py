@@ -1,4 +1,9 @@
-"""CLI entrypoint: `secha-transform <vendor> --date ...` (raw landing -> canonical)."""
+"""CLI entrypoint: `secha-transform run <vendor>` (raw landing -> canonical).
+
+`run` serves any vendor straight from its metadata. The first two vendors keep their own
+commands: MX Electrix scales values with factors from a second source (its device list),
+and both predate `run`.
+"""
 
 from __future__ import annotations
 
@@ -13,10 +18,16 @@ import typer
 from secha_transform import logging as transform_logging
 from secha_transform.config import Settings
 from secha_transform.engine.models import TransformStats
-from secha_transform.engine.transform import transform_records
+from secha_transform.engine.transform import entity_fields, transform_records
 from secha_transform.io.delta_sink import DeltaSink
-from secha_transform.io.reader import read_device_factors, read_records
-from secha_transform.io.writer import write_canonical_parquet
+from secha_transform.io.reader import (
+    iter_partitions,
+    layout_keys,
+    read_device_factors,
+    read_partition,
+    read_records,
+)
+from secha_transform.io.writer import write_canonical_parquet, write_entity_parquet
 from secha_transform.metadata.loader import MetadataBundle, load_bundle
 
 app = typer.Typer(
@@ -26,7 +37,8 @@ app = typer.Typer(
 
 @app.callback()
 def _main() -> None:
-    """SECHA transform engine (one subcommand per vendor)."""
+    """SECHA transform engine: `run <vendor>` for any vendor, plus the first two vendors' own
+    commands and the Delta / Unity Catalog commands."""
 
 
 def _validate_date(date: str) -> None:
@@ -145,6 +157,103 @@ def _batched(records: Iterable[dict[str, Any]], size: int) -> Iterator[list[dict
         yield batch
 
 
+def _add_stats(totals: TransformStats, stats: TransformStats) -> None:
+    for stat_field in dataclass_fields(TransformStats):
+        name = stat_field.name
+        setattr(totals, name, getattr(totals, name) + getattr(stats, name))
+
+
+def _parse_selection(select: list[str], layout: str) -> dict[str, str]:
+    keys = layout_keys(layout)
+    selection: dict[str, str] = {}
+    for item in select:
+        key, separator, value = item.partition("=")
+        if not (separator and key and value):
+            raise typer.BadParameter(f"--select takes key=value, got {item!r}")
+        if key not in keys:
+            raise typer.BadParameter(f"--select {key!r}: the layout's keys are {keys}")
+        selection[key] = value
+    return selection
+
+
+@app.command("run")
+def run_vendor(
+    vendor: Annotated[str, typer.Argument(help="Vendor directory in secha-metadata.")],
+    select: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--select",
+            help="Partitions to transform, as a layout key=value (repeatable). A layout key "
+            "left out takes every landed value.",
+        ),
+    ] = None,
+    batch_size: Annotated[
+        int, typer.Option(help="Records per transform/write batch (memory ceiling).")
+    ] = 100_000,
+) -> None:
+    """Transform one vendor's landed partitions into canonical rows, from its metadata alone.
+
+    Each partition streams in batches, and each batch writes part files named after its
+    partition, so re-running a partition replaces its own output (idempotent). A source
+    that declares sessions also writes one charging_session row per session, to
+    SECHA_DIMENSIONS_ROOT/charging_session.
+    """
+    transform_logging.configure()
+    settings = Settings()
+    bundle = _load_bundle_or_exit(settings, vendor)
+    if bundle.source_schema.get("device_factors"):
+        typer.secho(
+            f"{vendor} scales values with device factors from a second source, which `run` "
+            "does not read; use its own command",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    selection = _parse_selection(select or [], bundle.source_schema["access"]["layout"])
+    partitions = list(iter_partitions(settings.landing_root, bundle.source_schema, **selection))
+    if not partitions:
+        typer.secho(
+            f"No landed partitions for {vendor} match {selection or 'the layout'} under "
+            f"{settings.landing_root}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    sessions_root = f"{settings.dimensions_root}/charging_session"
+    session_types = entity_fields(bundle, "charging_session")
+    totals = TransformStats()
+    sessions_seen: set[str] = set()
+    for number, partition in enumerate(partitions, start=1):
+        records = read_partition(settings.landing_root, partition, bundle.source_schema)
+        partition_stats = TransformStats()
+        # A session can straddle two batches; each partition writes it once. Tracking this
+        # per partition, not per run, keeps a re-run of one partition byte-identical. A
+        # session that straddles two partitions is written by both and merged on its key.
+        partition_sessions: set[str] = set()
+        for index, batch in enumerate(_batched(records, batch_size)):
+            result = transform_records(batch, bundle)
+            run_tag = f"{partition.identity or 'all'}-b{index:05d}"
+            write_canonical_parquet(result.rows, settings.canonical_root, run_tag=run_tag)
+            new_sessions = [
+                session
+                for session in result.sessions
+                if str(session["session_id"]) not in partition_sessions
+            ]
+            partition_sessions.update(str(session["session_id"]) for session in new_sessions)
+            write_entity_parquet(new_sessions, sessions_root, session_types, run_tag=run_tag)
+            _add_stats(partition_stats, result.stats)
+        sessions_seen.update(partition_sessions)
+        _add_stats(totals, partition_stats)
+        typer.echo(
+            f"[{number}/{len(partitions)}] {partition.identity}: "
+            f"{partition_stats.records_in:,} records -> {partition_stats.rows_emitted:,} rows"
+        )
+    _echo_summary(totals, settings.canonical_root)
+    if sessions_seen:
+        typer.echo(f"{len(sessions_seen):,} distinct charging session(s) -> {sessions_root}")
+
+
 @app.command("procem")
 def procem(
     date: Annotated[str, typer.Option(help="Landing date (ProCem LOCAL day), YYYY-MM-DD.")],
@@ -173,9 +282,7 @@ def procem(
         path = write_canonical_parquet(
             result.rows, settings.canonical_root, run_tag=f"{date}-batch{index:05d}"
         )
-        for stat_field in dataclass_fields(TransformStats):
-            name = stat_field.name
-            setattr(totals, name, getattr(totals, name) + getattr(result.stats, name))
+        _add_stats(totals, result.stats)
     _echo_summary(totals, path)
     if sink == "delta":
         delta = _delta_sink_or_exit(settings, bundle)

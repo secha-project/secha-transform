@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from secha_transform.engine.models import CanonicalRow
+from secha_transform.engine.models import PAYLOAD_POSITION_FIELD, CanonicalRow
 from secha_transform.engine.transform import transform_records
 from secha_transform.metadata.loader import MetadataBundle
 
@@ -236,3 +236,126 @@ def test_unknown_datetime_format_raises() -> None:
     records = [{"measurement_id": "1", "value": "230.5", "timestamp": "1781470800246"}]
     with pytest.raises(ValueError, match="datetime_format"):
         transform_records(records, _long_bundle(datetime_format="stardate"))
+
+
+# --- session sources, positional row ids, per-column aggregation ------------------------
+
+SESSION_FIELDS = [
+    {"name": "session_id", "type": "string"},
+    {"name": "source_vendor", "type": "enum:source_vendor"},
+    {"name": "ev_model", "type": "string"},
+    {"name": "cal_year", "type": "int"},
+    {"name": "schema_version", "type": "string"},
+]
+
+
+def _session_bundle(session: dict[str, Any] | None = None) -> MetadataBundle:
+    return MetadataBundle(
+        vendor="demo_ev",
+        canonical={"entities": {"charging_session": {"fields": SESSION_FIELDS}}},
+        vocabulary={},
+        units={},
+        transforms={},
+        target={"measurement_id_from": ["source_vendor", "quantity", "source_row_id"]},
+        source_schema={
+            "record": {"row_id_from": "payload_position", "device_id_template": "demo_ev:all"},
+            "session": session
+            if session is not None
+            else {"id_field": "tx", "offset_field": "t", "attributes": {"ev_model": "model"}},
+            "defaults": {"aggregation": "average", "interval_s": 10},
+        },
+        mapping={
+            "source": "sessions",
+            "target_schema_version": "1.1.0",
+            "columns": [
+                {
+                    "src": "soc",
+                    "quantity": "state_of_charge",
+                    "phase": "none",
+                    "unit": "percent",
+                    "aggregation": "instantaneous",
+                },
+                {"src": "p", "quantity": "active_power", "phase": "dc", "unit": "W"},
+            ],
+        },
+        validation={},
+    )
+
+
+def _ev(tx: str | None, t: int, position: str | None, **extra: Any) -> dict[str, Any]:
+    record = {"tx": tx, "t": t, "model": "Example EV", "soc": 50.0, "p": 1000.0, **extra}
+    if position is not None:
+        record[PAYLOAD_POSITION_FIELD] = position
+    return record
+
+
+def test_wide_column_aggregation_overrides_the_source_default() -> None:
+    rows = transform_records([_ev("a", 0, "p:0")], _session_bundle()).rows
+    assert {r.quantity: r.aggregation for r in rows} == {
+        "state_of_charge": "instantaneous",
+        "active_power": "average",
+    }
+
+
+def test_payload_position_is_the_row_id_and_keeps_repeats_apart() -> None:
+    """Two readings at the same session offset differ only by where they sit in the payload."""
+    rows = transform_records([_ev("a", 10, "p:0"), _ev("a", 10, "p:1")], _session_bundle()).rows
+    assert {r.source_row_id for r in rows} == {"p:0", "p:1"}
+    assert len({r.measurement_id for r in rows}) == 4
+
+
+def test_a_record_without_its_position_raises() -> None:
+    with pytest.raises(ValueError, match="no position"):
+        transform_records([_ev("a", 0, None)], _session_bundle())
+
+
+def test_an_unknown_row_id_source_raises() -> None:
+    bundle = _session_bundle()
+    bundle.source_schema["record"]["row_id_from"] = "hash_of_everything"
+    with pytest.raises(ValueError, match="row_id_from"):
+        transform_records([_ev("a", 0, "p:0")], bundle)
+
+
+def test_session_fields_ride_on_every_row_and_one_session_row_per_session() -> None:
+    records = [_ev("a", 0, "p:0"), _ev("a", 10, "p:1"), _ev("b", 0, "p:2", model="Other EV")]
+    result = transform_records(records, _session_bundle())
+    assert {(r.session_id, r.ts_session_offset_s) for r in result.rows} == {
+        ("demo_ev:session:a", 0),
+        ("demo_ev:session:a", 10),
+        ("demo_ev:session:b", 0),
+    }
+    assert result.sessions == [
+        {
+            "session_id": "demo_ev:session:a",
+            "source_vendor": "demo_ev",
+            "ev_model": "Example EV",
+            "cal_year": None,
+            "schema_version": "1.1.0",
+        },
+        {
+            "session_id": "demo_ev:session:b",
+            "source_vendor": "demo_ev",
+            "ev_model": "Other EV",
+            "cal_year": None,
+            "schema_version": "1.1.0",
+        },
+    ]
+
+
+def test_session_attributes_are_typed_by_the_canonical_schema() -> None:
+    session = {"id_field": "tx", "attributes": {"cal_year": "year"}}
+    result = transform_records([_ev("a", 0, "p:0", year="2025")], _session_bundle(session))
+    assert result.sessions[0]["cal_year"] == 2025  # a string year becomes the schema's int
+
+
+def test_an_attribute_the_entity_lacks_raises() -> None:
+    session = {"id_field": "tx", "attributes": {"ev_modle": "model"}}
+    with pytest.raises(ValueError, match="not charging_session fields"):
+        transform_records([_ev("a", 0, "p:0")], _session_bundle(session))
+
+
+def test_a_source_without_sessions_emits_no_session_rows() -> None:
+    records = [{"meter": 7, "ts": "2025-01-01T00:00:00", "id": 1, "v": 230.0, "f": 50.0}]
+    result = transform_records(records, _bundle(), {"7": {"uk": 1.0, "ik": 1.0}})
+    assert result.sessions == []
+    assert {r.session_id for r in result.rows} == {None}
