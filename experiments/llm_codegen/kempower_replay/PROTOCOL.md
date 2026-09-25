@@ -263,3 +263,19 @@ a deviation with both runs kept.
 ## Deviations
 
 None yet. Any change after registration is appended here with its date and reason.
+
+### D1, 2026-09-25: two phrases of measure C, clarified before the replay code was committed
+
+Measure C says a program's level is "the highest it reaches on all three inputs". Level 1 is
+the strictest comparison, so a program that reaches level 1 also reaches levels 2 and 3, and
+"highest" read as the largest number would rank every exact program at level 3. The meaning
+P2 fixes ("reaches level 3 and not level 2") is the strictest level reached, and that is what
+the replay code reports: the lowest-numbered level a program reaches on all three inputs.
+
+Measure C also calls level 1 "every contract field (measure A's pass)". Measure A's pass
+compares every field except `measurement_id`, which it scores separately as the identity hash.
+Level 1 follows the level's own definition, every contract field, so it is measure A's pass
+with every identity hash equal as well.
+
+Both were found while writing the replay code, before any program ran on Kempower input.
+Neither changes a prediction, a program, an input or a measure.

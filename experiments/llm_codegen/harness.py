@@ -11,11 +11,15 @@ Usage:
     python harness.py run --models phi4-14b codestral-2508 --n 5 --repair 1
     python harness.py report --results results/<name>
     python harness.py inventory              # check the Kempower replay's frozen programs
+    python harness.py replay-cases           # build the replay's three Kempower cases
+    python harness.py replay --gates-only    # the gates G1 to G7, without the replay
+    python harness.py replay                 # the gates, then the replay, once
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import platform
@@ -31,7 +35,23 @@ from codegen.client import ChatClient, endpoint_for, extract_code, load_env_file
 from codegen.compare import score_case
 from codegen.metrics import micro
 from codegen.prompts import feedback_for, interpreter_messages, repair_messages, snapshot_messages
-from codegen.replay import build_inventory, inventory_differences
+from codegen.replay import build_inventory, digest, inventory_differences
+from codegen.replay_cases import build_replay_cases, records_digest
+from codegen.replay_report import OWN_AGGREGATION, build_replay_report
+from codegen.replay_run import (
+    ENGINE_COMMIT,
+    METADATA_COMMIT,
+    engine_reproduces,
+    frozen_sources_unchanged,
+    negative_control,
+    network_is_refused,
+    no_network,
+    ordered_differences,
+    positive_control,
+    replay_program,
+    summarise_program,
+    well_formed_rows,
+)
 from codegen.report import build_report
 from codegen.sandbox import execute
 
@@ -482,6 +502,214 @@ def cmd_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replay_cases(args: argparse.Namespace) -> int:
+    """Build the replay's three cases (PROTOCOL.md, Inputs). The September cases are untouched."""
+    cases, facts = build_replay_cases(args.metadata_root, args.landing_root)
+    manifest = _provenance(args.metadata_root) | {
+        "landing_root": str(args.landing_root),
+        "cases": facts,
+    }
+    save_cases(cases, REPLAY / "cases", manifest)
+    print(f"{'case':<32} {'records':>7} {'rows':>6} {'sessions':>8}  input")
+    for f in facts:
+        print(
+            f"{f['case']:<32} {f['records']:>7} {f['rows']:>6} "
+            f"{f['sessions_full_rulebook']:>8}  {f['input_sha256'][:12]}"
+        )
+    print(f"\n{len(cases)} cases written to {(REPLAY / 'cases').relative_to(HERE)}")
+    return 0
+
+
+def _replay_gates(
+    args: argparse.Namespace, cases: list[Case], inventory: dict[str, Any], reference: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """G1 to G7 (PROTOCOL.md, Validation before the replay), and the controls' results."""
+    gates: list[dict[str, Any]] = []
+
+    def gate(name: str, passed: bool, detail: str) -> None:
+        gates.append({"gate": name, "passed": passed, "detail": detail})
+        print(f"{name}: {'passed' if passed else 'FAILED'}: {detail}", flush=True)
+
+    gate("G7", network_is_refused(), "a connection attempt from the harness is refused")
+    gate("G1", cmd_selfcheck(args) == 0, "`python harness.py selfcheck`")
+
+    september = load_cases(args.cases)
+    different = engine_reproduces(args.metadata_root, september)
+    gate(
+        "G2",
+        not different,
+        f"{len(september) - len(different)} of {len(september)} September cases reproduced"
+        + (f"; different: {', '.join(different)}" if different else ""),
+    )
+
+    differences = inventory_differences(
+        inventory, build_inventory(HERE / "results", HERE / ".cache")
+    )
+    gate("G3", not differences, "; ".join(differences) or f"{len(inventory['programs'])} programs")
+
+    positive = replay_program(
+        positive_control(reference), "interpreter", cases, {}, args.exec_timeout
+    )
+    gate(
+        "G4",
+        all(
+            r["status"] == "ok"
+            and r["engine"]["passed"]
+            and r["engine"]["stats_equal"]
+            and r["engine"]["id_matches"] == r["engine"]["exact_rows"]
+            for r in positive
+        ),
+        "positive control against the engine: "
+        + ", ".join(f"{r['case'].rsplit('/', 1)[-1]} {r['status']}" for r in positive),
+    )
+    negative = replay_program(
+        negative_control(reference), "interpreter", cases, {}, args.exec_timeout
+    )
+    golden = next(r for r in negative if r["case"].endswith("golden_edge"))
+    gate(
+        "G5",
+        not golden["engine"]["passed"] and "quality" in golden["engine"]["field_errors"],
+        f"negative control on golden_edge: field errors {golden['engine']['field_errors']}",
+    )
+
+    moved = frozen_sources_unchanged(REPO, args.metadata_root, CONTRACT, REFERENCE)
+    provenance = _provenance(args.metadata_root)
+    if provenance["engine_dirty"] or provenance["metadata_dirty"]:
+        moved.append("a working tree is dirty")
+    manifest = json.loads((REPLAY / "cases" / "manifest.json").read_text(encoding="utf-8"))
+    built = {f["case"]: f["input_sha256"] for f in manifest["cases"]}
+    moved += [
+        f"{case.case_id} differs from the input its manifest records"
+        for case in cases
+        if built.get(case.case_id) != records_digest(case.records)
+    ]
+    gate(
+        "G6",
+        not moved,
+        "; ".join(moved)
+        or f"src as at {ENGINE_COMMIT}, rulebook as at {METADATA_COMMIT}, contract, reference "
+        "and cases unchanged, trees clean",
+    )
+    gates.sort(key=lambda g: g["gate"])
+
+    def without_output(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{k: v for k, v in r.items() if k != "output"} for r in results]
+
+    return gates, {"positive": without_output(positive), "negative": without_output(negative)}
+
+
+def cmd_replay(args: argparse.Namespace) -> int:
+    """The gates, then every registered program and the reference on every Kempower case."""
+    results_dir = REPLAY / "results"
+    record = results_dir / "replay.json"
+    if not args.gates_only and record.exists() and not args.rerun_reason:
+        print("the replay has already run; a second run needs --rerun-reason (PROTOCOL.md)")
+        return 1
+    started = datetime.now(UTC).isoformat(timespec="seconds")
+    cases = load_cases(REPLAY / "cases")
+    inventory = json.loads((REPLAY / "programs.json").read_text(encoding="utf-8"))
+    reference = REFERENCE.read_text(encoding="utf-8")
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    with no_network():
+        gates, controls = _replay_gates(args, cases, inventory, reference)
+        passed = all(g["passed"] for g in gates)
+        (results_dir / "gates.json").write_text(
+            json.dumps({"checked_at": started, "gates": gates, "controls": controls}, indent=1),
+            encoding="utf-8",
+        )
+        if args.gates_only or not passed:
+            print("\nall gates passed" if passed else "\nA GATE FAILED: the replay does not start")
+            return 0 if passed else 1
+
+        print("\nreplaying the reference interpreter and 60 programs", flush=True)
+        outputs: dict[str, dict[str, Any]] = {}
+        reference_results = replay_program(reference, "interpreter", cases, {}, args.exec_timeout)
+        reference_outputs = {r["case"]: r["output"] for r in reference_results}
+        reference_cases = []
+        for case, result in zip(cases, reference_results, strict=True):
+            rows = well_formed_rows(result["output"]) or []
+            reference_cases.append(
+                {
+                    "case": case.case_id,
+                    "rows": len(rows),
+                    "distinct_ids": result["identity"]["distinct_ids"],
+                    "quantities": len({row["quantity"] for row in rows}),
+                    "engine_rows": len(case.expected_rows),
+                    "engine_distinct_ids": len({r["measurement_id"] for r in case.expected_rows}),
+                    "differences": ordered_differences(case.expected_rows, rows)
+                    if result["status"] == "ok"
+                    else None,
+                    "own_aggregation_rows": dict(
+                        Counter(
+                            r["quantity"]
+                            for r in case.expected_rows
+                            if r["quantity"] in OWN_AGGREGATION
+                        )
+                    ),
+                    "stats_equal": result["engine"]["stats_equal"],
+                }
+            )
+        programs = []
+        for entry in inventory["programs"]:
+            source = None
+            if entry["script"] is not None:
+                source = (HERE / "results" / entry["run"] / entry["script"]).read_text(
+                    encoding="utf-8"
+                )
+                if digest(source) != entry["sha256"]:
+                    raise SystemExit(f"{entry['script']} differs from programs.json; stopping")
+            key = f"{entry['run']}/{entry['mode']}/{entry['seen_vendor']}/s{entry['sample']}"
+            results = replay_program(
+                source, entry["mode"], cases, reference_outputs, args.exec_timeout
+            )
+            outputs[key] = {r["case"]: r.pop("output") for r in results}
+            summary = summarise_program(results)
+            programs.append({**entry, "key": key, "results": results, "summary": summary})
+            print(
+                f"[{key}] {summary['statuses']} contract-exact "
+                f"{summary['contract_exact']} level {summary['level']}",
+                flush=True,
+            )
+        outputs["reference"] = {r["case"]: r.pop("output") for r in reference_results}
+
+    if record.exists():  # a second run keeps every file of the first (PROTOCOL.md, Procedure)
+        earlier = len(list(results_dir.glob("replay.run*.json"))) + 1
+        for name in ("replay.json", "outputs.json.gz", "report.md"):
+            path = results_dir / name
+            if path.exists():
+                stem, _, suffix = name.partition(".")
+                path.rename(results_dir / f"{stem}.run{earlier}.{suffix}")
+    result = {
+        "meta": _provenance(args.metadata_root)
+        | {
+            "frozen": {"engine_commit": ENGINE_COMMIT, "metadata_commit": METADATA_COMMIT},
+            "started_at": started,
+            "finished_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "timeout_s": args.exec_timeout,
+            "rerun_reason": args.rerun_reason,
+        },
+        "gates": gates,
+        "controls": controls,
+        "cases": json.loads((REPLAY / "cases" / "manifest.json").read_text(encoding="utf-8"))[
+            "cases"
+        ],
+        "reference": {
+            "results": reference_results,
+            "summary": summarise_program(reference_results),
+            "cases": reference_cases,
+        },
+        "programs": programs,
+    }
+    record.write_text(json.dumps(result, indent=1), encoding="utf-8")
+    with gzip.open(results_dir / "outputs.json.gz", "wt", encoding="utf-8") as handle:
+        json.dump(outputs, handle)
+    report = build_replay_report(result)
+    (results_dir / "report.md").write_text(report, encoding="utf-8")
+    print("\n" + report)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--metadata-root", type=Path, default=REPO.parent / "secha-metadata")
@@ -526,6 +754,13 @@ def main() -> int:
     inventory = sub.add_parser("inventory")
     inventory.add_argument("--write", action="store_true", help="record, instead of check")
 
+    sub.add_parser("replay-cases")
+    replay = sub.add_parser("replay")
+    replay.add_argument("--gates-only", action="store_true", help="check G1 to G7 and stop")
+    replay.add_argument(
+        "--rerun-reason", help="allow a second run, for a harness fault, and record why"
+    )
+
     args = parser.parse_args()
     commands = {
         "build-cases": cmd_build_cases,
@@ -535,6 +770,8 @@ def main() -> int:
         "run": cmd_run,
         "report": cmd_report,
         "inventory": cmd_inventory,
+        "replay-cases": cmd_replay_cases,
+        "replay": cmd_replay,
     }
     return commands[args.command](args)
 

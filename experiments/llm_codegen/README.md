@@ -211,7 +211,11 @@ sample index.
 The recorded programs are replayed on Kempower, a vendor none of them saw, under a protocol
 registered before the replay ran: [kempower_replay/PROTOCOL.md](kempower_replay/PROTOCOL.md).
 `python harness.py inventory` checks that every program it names is still exactly what a
-cached model reply contained.
+cached model reply contained. The replay then runs in the protocol's order:
+`python harness.py replay-cases` builds its three cases in `kempower_replay/cases/` (never in
+`cases/`), `python harness.py replay --gates-only` checks the gates G1 to G7, and
+`python harness.py replay` checks them again and runs every program once, writing to
+`kempower_replay/results/`.
 
 ## Results
 
