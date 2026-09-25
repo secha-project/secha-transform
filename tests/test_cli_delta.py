@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from secha_transform.cli import app
+
+# Typer forces colour when GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS is set, as on CI, and it
+# decides this on import; so the test reads the message with any colour codes taken out.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def test_delta_load_refuses_an_undeclared_entity_before_connecting(
@@ -19,5 +24,6 @@ def test_delta_load_refuses_an_undeclared_entity_before_connecting(
     result = CliRunner().invoke(app, ["delta-load", "--staging", "/nowhere", "--entity", "tariff"])
 
     assert result.exit_code == 2, result.output  # a usage error, not a platform failure
-    message = " ".join(result.output.replace("│", " ").split())  # unwrap the error box
+    plain = _ANSI.sub("", result.output)
+    message = " ".join(plain.replace("│", " ").split())  # unwrap the error box
     assert "entity 'tariff' is neither the fact table nor a declared dimension" in message
