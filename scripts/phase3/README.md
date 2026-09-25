@@ -104,7 +104,7 @@ What each check proves, in order:
 
 | Check | Proves |
 |---|---|
-| spark connect session | VPN + gRPC endpoint + client 4.1.1 vs server 4.1.1 handshake |
+| spark connect session | VPN + gRPC endpoint + client/server handshake (it prints the server's Spark version: 4.1.1 in July, 4.2.0 by 2026-09-24; the 4.1.1 client works with both) |
 | catalog registration | `UCSingleCatalog` accepts SESSION-level registration for a new name |
 | catalog reachable | the `secha` catalog exists and the token is accepted |
 | create schema | the token has write rights (`secha.canonical`) |
@@ -188,6 +188,29 @@ ssh sparky@130.230.115.138 "find /net/nfs/data/secha/canonical-staging/load-001 
 A VPN drop mid-MERGE is safe: the MERGE is idempotent, just re-run. `merged_rows` slightly
 below `staged_rows` is fine (genuine same-instant duplicate readings deduped). Afterwards the
 table is visible in the UC web UI (:3000, secha -> canonical -> measurement).
+
+## Loading a large vendor: one part per MERGE (Kempower, 2026-09-24)
+
+```bash
+bash scripts/phase3/load_kempower.sh 10 20 30    # parts 10, 20 and 30, then their sessions
+```
+
+- Delta copies each MERGE's source to the workers' scratch space, which on this platform is a
+  32 GB swap-backed `/tmp`, so keep a MERGE to about one landed part (3.7M rows). The script
+  checks every part against the local files before staging, confirms each staged file on the
+  NFS, and stops at the first failure; re-running any part is safe.
+- If a load fails, read why from the Spark UI's REST API (read-only), never by running the load
+  again:
+
+  ```bash
+  curl -s http://130.230.115.138:4040/api/v1/applications                  # the application id
+  curl -s "http://130.230.115.138:4040/api/v1/applications/<id>/stages?status=failed"
+  curl -s "http://130.230.115.138:4040/api/v1/applications/<id>/storage/rdd"  # leftover copies
+  ```
+
+- A failed MERGE can leave its source copy on the executors until Spark's periodic cleanup, up
+  to 30 minutes later, and while it is there every job on that worker can fail. `storage/rdd`
+  shows it; wait for it to clear before the next load. Full account: `docs/phase3-log.md`.
 
 ## Step-0 done criteria
 

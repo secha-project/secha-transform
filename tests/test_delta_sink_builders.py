@@ -19,6 +19,7 @@ from secha_transform.io.delta_sink import (
     build_serving_view_sql,
     build_staged_projection_sql,
     dimension_rows,
+    entity_target,
     full_table_name,
     serving_mode,
     spark_type_for,
@@ -229,3 +230,98 @@ def test_dimension_insert_nulls_missing_attributes() -> None:
     rows = dimension_rows({"x": {"default_unit": "V"}}, _DIM_COLUMNS)
     sql = build_dimension_insert("secha.canonical.quantity", _DIM_COLUMNS, rows)
     assert "('x', 'V', NULL, NULL)" in sql  # absent standard_ref/description -> NULL, not ''
+
+
+# --- dimensions: any entity the target binding declares loads like the fact ---------------
+
+SESSION_CANONICAL = {
+    "entities": {
+        **CANONICAL["entities"],
+        "charging_session": {
+            "fields": [
+                {"name": "session_id", "type": "string"},
+                {"name": "source_vendor", "type": "enum:source_vendor"},
+                {"name": "cal_year", "type": "int"},
+            ]
+        },
+    }
+}
+SESSION_TARGET = {
+    **TARGET,
+    "dimensions": {
+        "charging_session": {
+            "schema": "canonical",
+            "table": "charging_session",
+            "merge_key": ["session_id"],
+        }
+    },
+}
+
+
+def _session_bundle() -> MetadataBundle:
+    bundle = _bundle(SESSION_TARGET)
+    return MetadataBundle(**{**bundle.__dict__, "canonical": SESSION_CANONICAL})
+
+
+def test_a_dimension_table_is_unpartitioned_and_carries_platform_properties() -> None:
+    ddl = build_create_table_sql(_session_bundle(), "charging_session")
+    assert ddl.startswith("CREATE TABLE IF NOT EXISTS secha.canonical.charging_session")
+    assert "cal_year INT" in ddl and "event_date" not in ddl
+    assert "PARTITIONED BY" not in ddl
+    assert "TBLPROPERTIES ('delta.feature.catalogManaged' = 'supported')" in ddl
+
+
+def test_a_dimension_merges_on_its_own_key() -> None:
+    sql = build_merge_sql(_session_bundle(), entity="charging_session")
+    assert "MERGE INTO secha.canonical.charging_session AS t" in sql
+    assert "ON t.session_id = s.session_id" in sql
+
+
+def test_a_dimension_without_ingested_at_keeps_the_same_copy_on_every_run() -> None:
+    # ordered by its other STAGED columns (cal_year is not staged, so it cannot order)
+    sql = build_staged_projection_sql(
+        _session_bundle(), {"session_id", "source_vendor"}, entity="charging_session"
+    )
+    assert "PARTITION BY session_id ORDER BY source_vendor" in sql
+    assert "CAST(NULL AS INT) AS cal_year" in sql
+    only_key = build_staged_projection_sql(
+        _session_bundle(), {"session_id"}, entity="charging_session"
+    )
+    assert "PARTITION BY session_id ORDER BY session_id" in only_key
+
+
+def test_an_undeclared_entity_raises() -> None:
+    with pytest.raises(ValueError, match="neither the fact table nor a declared dimension"):
+        entity_target(_session_bundle(), "tariff")
+
+
+def test_a_dimension_reads_the_canonical_entity_its_table_names() -> None:
+    # the declared name and the table may differ; the validator resolves `table`
+    target = {
+        **SESSION_TARGET,
+        "dimensions": {"sessions": SESSION_TARGET["dimensions"]["charging_session"]},
+    }
+    bundle = MetadataBundle(**{**_bundle(target).__dict__, "canonical": SESSION_CANONICAL})
+    loaded = entity_target(bundle, "sessions")
+    assert loaded.qualified == "secha.canonical.charging_session"
+    assert ("cal_year", "INT") in loaded.columns
+
+
+def test_a_dimension_naming_no_canonical_entity_raises() -> None:
+    decl = {"schema": "canonical", "table": "tariff", "merge_key": ["tariff_id"]}
+    bundle = _bundle({**TARGET, "dimensions": {"tariff": decl}})
+    with pytest.raises(ValueError, match="not a canonical entity"):
+        entity_target(bundle, "tariff")
+
+
+def test_a_merge_key_outside_the_columns_raises() -> None:
+    decl = {**SESSION_TARGET["dimensions"]["charging_session"], "merge_key": ["transaction_id"]}
+    target = {**SESSION_TARGET, "dimensions": {"charging_session": decl}}
+    bundle = MetadataBundle(**{**_bundle(target).__dict__, "canonical": SESSION_CANONICAL})
+    with pytest.raises(ValueError, match="not among its columns"):
+        entity_target(bundle, "charging_session")
+
+
+def test_the_fact_table_is_the_default_entity() -> None:
+    assert entity_target(_bundle()).qualified == "secha.canonical.measurement"
+    assert entity_target(_bundle(), "measurement").partition_by == ["source_vendor", "event_date"]

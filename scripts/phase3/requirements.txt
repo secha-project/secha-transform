@@ -1,3 +1,4 @@
-# Pinned to the platform's Spark 4.1.1: the Connect client version must match the server.
+# Pinned to 4.1.1, the platform's Spark when Phase 3 was built. The server now runs 4.2.0,
+# which this client works with (verified 2026-09-24). Keep in step with pyproject.toml.
 pyspark-client==4.1.1
 requests>=2.32

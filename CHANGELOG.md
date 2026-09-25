@@ -25,6 +25,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   other canonical entities.
 - Golden test for the Kempower contract in `secha-metadata` (synthetic fixture, run through the
   real Parquet read path), unit tests for each capability, and an end-to-end CLI test.
+- **Dimension MERGE in the Delta sink**: `delta-load --entity <name>` loads any entity the target
+  declares under `dimensions:` (Kempower's `charging_session`, merge key `session_id`) with the
+  same DDL, dedupe and MERGE builders as the fact table. The table name, merge key and columns
+  come from `targets/canonical.yaml` and the canonical entity its `table` names; the fact table
+  stays the default, and its SQL is unchanged. An entity the target does not declare, a
+  dimension naming no canonical entity, or a merge key outside the entity's columns is refused
+  before connecting. An entity without `ingested_at` keeps, per key, the first copy in the order
+  of its other staged columns, so every run keeps the same one.
+- `scripts/phase3/load_kempower.sh PART...`: checks every part against the local files, then
+  stages one landed part at a time on the cluster NFS, confirms each staged file there, and
+  MERGEs it; finally it MERGEs the same parts' sessions into `charging_session`. One part per
+  MERGE because of the platform limit recorded in `docs/phase3-log.md` (2026-09-24).
 ### Fixed
 - Rows without clock time get a null `event_date`, stored in Hive's default partition. The
   writer used the string `"unknown"`, which the Delta table's DATE column would reject under

@@ -6,7 +6,8 @@
 (`secha-metadata`) and produces **canonical** rows. It is a *deterministic interpreter of metadata*:
 **no vendor logic lives in the engine**. Swap a config, get different output, zero code change. That
 decoupling is the central interoperability claim of the thesis, demonstrated with two vendors end to
-end, and tested on a third, Kempower, which needed new generic capabilities but no vendor logic.
+end, and tested on a third, Kempower, which needed new generic capabilities but no vendor logic and
+now sits in the same Unity Catalog table.
 
 ## Architecture at a glance
 
@@ -50,7 +51,7 @@ only sets `quantity`. The long form is the **interoperability substrate**, not w
 Phase 3 builds **wide serving views** (one column per quantity) shaped per use case, so analysts get a
 friendly wide table while the long form does the flexible plumbing underneath.
 
-## Proven end-to-end (two vendors in one canonical table, a third transformed)
+## Proven end-to-end (three vendors in one canonical table)
 - **MX Electrix** (wide JSON API): a full real day, **1,440 one-minute records → ~36,000 canonical
   rows** (unpivot fan-out).
 - **ProCem Kampusareena** (long 1 Hz file triples): a full real day, **14,476,804 records →
@@ -63,7 +64,8 @@ friendly wide table while the long form does the flexible plumbing underneath.
   landed parts, **71,793,566 records -> 358,967,830 canonical rows** and 396,848 charging
   sessions in 2.3 h; reconciled against the raw parts independently (rows = non-empty cells per
   quantity, value sums equal, the 709 suspect readings = the export's 709 negative voltages).
-  Not yet loaded into Unity Catalog.
+  Every tenth part (36,348,545 rows, 40,175 sessions) is in Unity Catalog, each part's MERGE
+  adding exactly its local row count; the rest waits on a platform limit (Phase 3 below).
 - Golden tests assert the engine reproduces the exact canonical rows defined by the
   `secha-metadata` contract for **all three** vendors.
 
@@ -100,19 +102,23 @@ docs/         architecture diagram
   outcome is **counted** in the run stats (`TransformResult.stats`), and a declared rule the engine
   cannot honour **raises**. Remaining primitives are added as column families are mapped.
 - **Phase 3 (done, live on the TUNI cluster):** Delta / Unity Catalog via Spark Connect (the `spark`
-  extra, pinned `pyspark-client==4.1.1`). `io/delta_sink.py` generates the table DDL from
+  extra, pinned `pyspark-client==4.1.1`, which also works with the server's newer Spark 4.2.0).
+  `io/delta_sink.py` generates the table DDL from
   `canonical_schema.yaml` + the target's `table_properties` (incl. the platform-required
   `delta.feature.catalogManaged`), reads cluster-visible staging parquet, dedupes on the merge key
-  (latest `ingested_at` wins), and `MERGE`s on `measurement_id`. Serving definitions come from the
+  (latest `ingested_at` wins), and `MERGE`s on `measurement_id`; a dimension the target declares
+  (e.g. `charging_session`) loads the same way on its own key (`delta-load --entity`). Serving definitions come from the
   rulebook's `serving/*.sql` (`{canonical}` placeholder), materialised per the target's
   `serving_mode` (Delta snapshots here: this UC connector lacks views and RTAS). Reference
   dimensions (e.g. `secha.canonical.quantity`) are published from the rulebook vocabularies so
   consumers JOIN the long fact for descriptions + standards.
   CLI: `delta-load`, `delta-views` (dimensions + serving), and `--sink delta` on the vendor commands.
-  **Verified live:** `secha.canonical.measurement` holds 5,535,568 rows (both vendors; re-running
-  the load reports `5535568 -> 5535568`, the platform-level idempotency proof) and
-  `secha.serving.pq_minute_wide` answers the convergence query. Full record:
-  [docs/phase3-log.md](docs/phase3-log.md).
+  **Verified live:** `secha.canonical.measurement` holds 5,535,568 rows for the first two vendors
+  (re-running the load reports `5535568 -> 5535568`, the platform-level idempotency proof) and
+  `secha.serving.pq_minute_wide` answers the convergence query. Kempower followed on 2026-09-24:
+  every tenth part, 36,348,545 rows (41,884,113 in the table), with 40,175 sessions in
+  `secha.canonical.charging_session`; the full 359M rows stay in local Parquet because of a
+  platform scratch-space limit. Full record: [docs/phase3-log.md](docs/phase3-log.md).
 
 ## Configuration
 All settings are environment variables prefixed `SECHA_` (read from `.env`; see `.env.template`). None
@@ -143,6 +149,7 @@ uv run secha-transform run kempower --select part=00000-c000      # one partitio
 
 # Phase 3 (needs the spark extra + .env platform values + TUNI VPN):
 uv run secha-transform delta-load --staging /net/nfs/data/secha/canonical-staging/load-001
+uv run secha-transform delta-load --staging <dir> --entity charging_session   # a declared dimension
 uv run secha-transform delta-views                                # publish reference dimensions + serving snapshots
 ```
 (No uv? `python -m venv .venv && .venv/Scripts/pip install -e . && .venv/Scripts/pip install pytest mypy ruff`,
@@ -198,9 +205,10 @@ line of vendor logic; the costs are measured in `secha-metadata`'s onboarding di
   without a date, streaming/batched processing, and **validation application** (flag/drop/reject
   with counted run stats). Unimplemented transforms, formats, and rules fail loudly. No vendor
   name appears in the engine or IO layers; the CLI names only the first two vendors' own commands.
-- **Kempower in Unity Catalog is the next step.** The local canonical output exists; loading it
-  needs a Spark-side check that the null `event_date` partition reads as null, and a MERGE for the
-  `charging_session` table, which the sink does not have yet.
+- **Kempower is in Unity Catalog as a subset.** Every tenth part is loaded and verified, with its
+  sessions in `charging_session`; Spark reads the null `event_date` partition as null. The full
+  359M rows wait for the platform's Spark scratch space to move from a 32 GB swap-backed `/tmp` to
+  disk ([docs/phase3-log.md](docs/phase3-log.md), 2026-09-24).
 - **Phase 3 is live.** Operational notes: platform commands need the TUNI VPN + a Unity Catalog token
   in `.env`; staged canonical parquet must sit on the cluster NFS (`/net/nfs`); serving snapshots are
   refreshed by re-running `delta-views` after each `delta-load`. Platform runbook + facts learned:

@@ -106,8 +106,8 @@ def check_session(spark_url: str, catalog_url: str, token: str, catalog: str) ->
     except ImportError:
         _die(
             "pyspark-client import",
-            "  pip install -r requirements.txt (pyspark-client==4.1.1; the version is pinned\n"
-            "  to the server's Spark 4.1.1, do not upgrade it independently).",
+            "  pip install -r requirements.txt (pyspark-client==4.1.1; the pin moves together\n"
+            "  with pyproject.toml's, in step with the server's Spark, which this check reports).",
         )
     started = time.monotonic()
     try:

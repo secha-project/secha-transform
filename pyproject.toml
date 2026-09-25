@@ -18,8 +18,10 @@ dependencies = [
 
 [project.optional-dependencies]
 # Phase 3: write canonical to Delta / Unity Catalog on the TUNI Spark Connect cluster.
-# pyspark-client is the slim Spark Connect client; PINNED to the server's Spark 4.1.1
-# (Connect requires matching versions). Delta runs server-side; no client jar needed.
+# pyspark-client is the slim Spark Connect client, PINNED to 4.1.1, the server's Spark when
+# Phase 3 was built. The server has run 4.2.0 since at least 2026-09-24, and this client
+# works with it for everything the sink sends; move the pin to the server's version (and
+# retest on the platform) when convenient. Delta runs server-side; no client jar needed.
 spark = ["pyspark-client==4.1.1"]
 s3 = ["s3fs>=2024.6"]
 azure = ["adlfs>=2024.4"]

@@ -60,63 +60,140 @@ def full_table_name(bundle: MetadataBundle) -> str:
     return f"{target['catalog']}.{target['schema']}.{target['table']}"
 
 
-def build_create_schema_sql(bundle: MetadataBundle) -> str:
+@dataclass(frozen=True)
+class EntityTarget:
+    """Where and how one canonical entity loads: the fact table or a declared dimension."""
+
+    qualified: str
+    schema: str  # catalog.schema, for CREATE SCHEMA
+    columns: list[tuple[str, str]]
+    merge_key: list[str]
+    partition_by: list[str]
+
+
+def entity_target(bundle: MetadataBundle, entity: str | None = None) -> EntityTarget:
+    """The load target for an entity, from the target binding; None means the fact table.
+
+    A dimension (`targets/canonical.yaml` `dimensions:`) takes its table and merge key from
+    the binding and its columns from the canonical entity the binding's `table` names (the
+    same reading the rulebook validator checks), and is not partitioned: it is small, and
+    its rows are looked up by key. An undeclared entity, or a merge key that is not one of
+    the entity's columns, raises here, before anything connects.
+    """
     target = bundle.target
-    return f"CREATE SCHEMA IF NOT EXISTS {target['catalog']}.{target['schema']}"
+    catalog = target["catalog"]
+    if entity is None or entity == target["table"]:
+        loaded = EntityTarget(
+            qualified=full_table_name(bundle),
+            schema=f"{catalog}.{target['schema']}",
+            columns=table_columns(bundle),
+            merge_key=list(target["merge_key"]),
+            partition_by=list(target.get("partition_by", [])),
+        )
+    else:
+        decl = (target.get("dimensions") or {}).get(entity)
+        if decl is None:
+            raise ValueError(
+                f"entity '{entity}' is neither the fact table nor a declared dimension"
+            )
+        canonical_entity = bundle.canonical["entities"].get(decl["table"])
+        if canonical_entity is None:
+            raise ValueError(
+                f"dimension '{entity}' names table '{decl['table']}', "
+                "which is not a canonical entity"
+            )
+        schema = decl.get("schema", target["schema"])
+        loaded = EntityTarget(
+            qualified=f"{catalog}.{schema}.{decl['table']}",
+            schema=f"{catalog}.{schema}",
+            columns=[
+                (field["name"], spark_type_for(field["type"]))
+                for field in canonical_entity["fields"]
+            ],
+            merge_key=list(decl["merge_key"]),
+            partition_by=[],
+        )
+    column_names = {name for name, _ in loaded.columns}
+    missing = [key for key in loaded.merge_key if key not in column_names]
+    if missing:
+        raise ValueError(f"merge key {missing} of {loaded.qualified} is not among its columns")
+    return loaded
 
 
-def build_create_table_sql(bundle: MetadataBundle) -> str:
+def build_create_schema_sql(bundle: MetadataBundle, entity: str | None = None) -> str:
+    return f"CREATE SCHEMA IF NOT EXISTS {entity_target(bundle, entity).schema}"
+
+
+def build_create_table_sql(bundle: MetadataBundle, entity: str | None = None) -> str:
     """CREATE TABLE IF NOT EXISTS, columns + partitioning + platform table properties."""
-    target = bundle.target
-    columns = ",\n  ".join(f"{name} {spark_type}" for name, spark_type in table_columns(bundle))
-    partition_cols = ", ".join(target.get("partition_by", []))
+    loaded = entity_target(bundle, entity)
+    columns = ",\n  ".join(f"{name} {spark_type}" for name, spark_type in loaded.columns)
+    partition_cols = ", ".join(loaded.partition_by)
     partition_clause = f"\nPARTITIONED BY ({partition_cols})" if partition_cols else ""
-    properties = target.get("table_properties") or {}
+    properties = bundle.target.get("table_properties") or {}
     property_items = ", ".join(f"'{key}' = '{value}'" for key, value in properties.items())
     properties_clause = f"\nTBLPROPERTIES ({property_items})" if property_items else ""
     return (
-        f"CREATE TABLE IF NOT EXISTS {full_table_name(bundle)} (\n  {columns}\n)\n"
+        f"CREATE TABLE IF NOT EXISTS {loaded.qualified} (\n  {columns}\n)\n"
         f"USING DELTA{partition_clause}{properties_clause}"
     )
 
 
 def build_staged_projection_sql(
-    bundle: MetadataBundle, available_columns: set[str], raw_view: str = _STAGED_RAW_VIEW
+    bundle: MetadataBundle,
+    available_columns: set[str],
+    raw_view: str = _STAGED_RAW_VIEW,
+    entity: str | None = None,
 ) -> str:
     """Typed, deduplicated projection of the staged parquet.
 
     Every table column is produced: staged columns are CAST to the canonical type,
     columns the engine does not emit (e.g. location_id) become typed NULLs. Duplicates
     on the merge key are resolved before MERGE (which rejects multiple matches):
-    the latest `ingested_at` wins, so revised data converges deterministically.
+    the latest `ingested_at` wins, so revised data converges deterministically. An
+    entity without `ingested_at` (e.g. a session that two landed partitions both wrote)
+    keeps the first copy in the order of its other staged columns: the copies are
+    expected to be identical, and if they ever differ, every run still keeps the same one.
     """
+    loaded = entity_target(bundle, entity)
     casts = ",\n  ".join(
         f"CAST({name} AS {spark_type}) AS {name}"
         if name in available_columns
         else f"CAST(NULL AS {spark_type}) AS {name}"
-        for name, spark_type in table_columns(bundle)
+        for name, spark_type in loaded.columns
     )
-    key = bundle.target["merge_key"]
-    partition_key = ", ".join(key)
+    partition_key = ", ".join(loaded.merge_key)
+    if any(name == "ingested_at" for name, _ in loaded.columns):
+        order = "ingested_at DESC"
+    else:
+        others = [
+            name
+            for name, _ in loaded.columns
+            if name in available_columns and name not in loaded.merge_key
+        ]
+        order = ", ".join(others) or partition_key
     return (
         f"SELECT\n  {casts}\nFROM (\n"
         f"  SELECT *, row_number() OVER (\n"
-        f"    PARTITION BY {partition_key} ORDER BY ingested_at DESC\n"
+        f"    PARTITION BY {partition_key} ORDER BY {order}\n"
         f"  ) AS _rn\n"
         f"  FROM {raw_view}\n"
         f") WHERE _rn = 1"
     )
 
 
-def build_merge_sql(bundle: MetadataBundle, staged_view: str = _STAGED_VIEW) -> str:
+def build_merge_sql(
+    bundle: MetadataBundle, staged_view: str = _STAGED_VIEW, entity: str | None = None
+) -> str:
     """MERGE on the configured key; explicit column lists (no schema-drift surprises)."""
-    columns = [name for name, _ in table_columns(bundle)]
-    on = " AND ".join(f"t.{key} = s.{key}" for key in bundle.target["merge_key"])
+    loaded = entity_target(bundle, entity)
+    columns = [name for name, _ in loaded.columns]
+    on = " AND ".join(f"t.{key} = s.{key}" for key in loaded.merge_key)
     update_set = ", ".join(f"t.{name} = s.{name}" for name in columns)
     insert_cols = ", ".join(columns)
     insert_vals = ", ".join(f"s.{name}" for name in columns)
     return (
-        f"MERGE INTO {full_table_name(bundle)} AS t\n"
+        f"MERGE INTO {loaded.qualified} AS t\n"
         f"USING {staged_view} AS s\n"
         f"ON {on}\n"
         f"WHEN MATCHED THEN UPDATE SET {update_set}\n"
@@ -255,7 +332,7 @@ class DeltaSink:
     def __init__(self, spark_url: str, catalog_url: str, token: str, catalog: str) -> None:
         try:
             from pyspark.sql import SparkSession
-        except ImportError as exc:  # pragma: no cover - depends on optional extra
+        except ImportError as exc:  # pragma: no cover (depends on the optional extra)
             raise RuntimeError(
                 "pyspark-client is not installed; install the 'spark' extra "
                 "(pip install -e '.[spark]')"
@@ -271,26 +348,29 @@ class DeltaSink:
             .getOrCreate()
         )
 
-    def ensure_table(self, bundle: MetadataBundle) -> str:
-        """Create schema + fact table if absent (DDL generated from the rulebook)."""
-        self._spark.sql(build_create_schema_sql(bundle))
-        self._spark.sql(build_create_table_sql(bundle))
-        return full_table_name(bundle)
+    def ensure_table(self, bundle: MetadataBundle, entity: str | None = None) -> str:
+        """Create schema + table if absent (DDL generated from the rulebook); the fact
+        table by default, or a declared dimension such as charging_session."""
+        self._spark.sql(build_create_schema_sql(bundle, entity))
+        self._spark.sql(build_create_table_sql(bundle, entity))
+        return entity_target(bundle, entity).qualified
 
-    def merge_staging(self, staging_path: str, bundle: MetadataBundle) -> MergeReport:
+    def merge_staging(
+        self, staging_path: str, bundle: MetadataBundle, entity: str | None = None
+    ) -> MergeReport:
         """Read staged parquet (cluster-visible path), dedupe, MERGE; return counts."""
-        table = full_table_name(bundle)
+        table = entity_target(bundle, entity).qualified
         path = staging_path if "://" in staging_path else f"file://{staging_path}"
         staged = self._spark.read.option("basePath", path).parquet(path)
         staged.createOrReplaceTempView(_STAGED_RAW_VIEW)
         staged_rows = staged.count()
 
-        projection = build_staged_projection_sql(bundle, set(staged.columns))
+        projection = build_staged_projection_sql(bundle, set(staged.columns), entity=entity)
         self._spark.sql(projection).createOrReplaceTempView(_STAGED_VIEW)
         merged_rows = self._spark.sql(f"SELECT count(*) FROM {_STAGED_VIEW}").collect()[0][0]
 
         before = self._spark.sql(f"SELECT count(*) FROM {table}").collect()[0][0]
-        self._spark.sql(build_merge_sql(bundle))
+        self._spark.sql(build_merge_sql(bundle, entity=entity))
         after = self._spark.sql(f"SELECT count(*) FROM {table}").collect()[0][0]
         return MergeReport(
             staged_rows=staged_rows,

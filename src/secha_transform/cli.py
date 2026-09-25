@@ -19,7 +19,7 @@ from secha_transform import logging as transform_logging
 from secha_transform.config import Settings
 from secha_transform.engine.models import TransformStats
 from secha_transform.engine.transform import entity_fields, transform_records
-from secha_transform.io.delta_sink import DeltaSink
+from secha_transform.io.delta_sink import DeltaSink, entity_target
 from secha_transform.io.reader import (
     iter_partitions,
     layout_keys,
@@ -97,9 +97,11 @@ def _delta_sink_or_exit(settings: Settings, bundle: MetadataBundle) -> DeltaSink
         raise typer.Exit(code=1) from exc
 
 
-def _merge_and_echo(sink: DeltaSink, staging: str, bundle: MetadataBundle) -> None:
-    table = sink.ensure_table(bundle)
-    report = sink.merge_staging(staging, bundle)
+def _merge_and_echo(
+    sink: DeltaSink, staging: str, bundle: MetadataBundle, entity: str | None = None
+) -> None:
+    table = sink.ensure_table(bundle, entity)
+    report = sink.merge_staging(staging, bundle, entity)
     typer.echo(
         f"MERGE into {table}: staged {report.staged_rows} rows "
         f"({report.merged_rows} after dedupe on the merge key); "
@@ -301,11 +303,22 @@ def delta_load(
             "/net/nfs/data/secha/canonical-staging); defaults to SECHA_STAGING_ROOT."
         ),
     ] = None,
+    entity: Annotated[
+        str | None,
+        typer.Option(
+            help="Load a dimension declared in the target binding (e.g. charging_session) "
+            "instead of the measurement table."
+        ),
+    ] = None,
 ) -> None:
     """MERGE staged canonical parquet into Delta/Unity Catalog (idempotent re-runs)."""
     transform_logging.configure()
     settings = Settings()
     bundle = _load_bundle_or_exit(settings, "mx_electrix")  # any vendor: target layer is shared
+    try:
+        entity_target(bundle, entity)  # an undeclared entity fails here, before connecting
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     staging_path = staging or settings.staging_root
     if not staging_path:
         typer.secho(
@@ -316,7 +329,7 @@ def delta_load(
         raise typer.Exit(code=1)
     delta = _delta_sink_or_exit(settings, bundle)
     try:
-        _merge_and_echo(delta, staging_path, bundle)
+        _merge_and_echo(delta, staging_path, bundle, entity)
     finally:
         delta.stop()
 
