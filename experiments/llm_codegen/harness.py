@@ -10,6 +10,7 @@ Usage:
     python harness.py probe-context --model phi4-14b --tokens 12000
     python harness.py run --models phi4-14b codestral-2508 --n 5 --repair 1
     python harness.py report --results results/<name>
+    python harness.py inventory              # check the Kempower replay's frozen programs
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from codegen.client import ChatClient, endpoint_for, extract_code, load_env_file
 from codegen.compare import score_case
 from codegen.metrics import micro
 from codegen.prompts import feedback_for, interpreter_messages, repair_messages, snapshot_messages
+from codegen.replay import build_inventory, inventory_differences
 from codegen.report import build_report
 from codegen.sandbox import execute
 
@@ -37,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 CONTRACT = HERE / "CONTRACT.md"
 REFERENCE = HERE / "reference" / "interpreter.py"
+REPLAY = HERE / "kempower_replay"
 FREEZE_LINE = "RULEBOOK: dict[str, Any] | None = None"
 MUTANTS = {
     "no_scaling": (
@@ -460,6 +463,25 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inventory(args: argparse.Namespace) -> int:
+    """Check, or with --write record, the programs the Kempower replay may run."""
+    current = build_inventory(HERE / "results", HERE / ".cache")
+    path = REPLAY / "programs.json"
+    if args.write:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(current, indent=1) + "\n", encoding="utf-8", newline="\n")
+        print(f"recorded {len(current['programs'])} programs in {path.relative_to(HERE)}")
+        return 0
+    recorded = json.loads(path.read_text(encoding="utf-8"))
+    differences = inventory_differences(recorded, current)
+    for line in differences:
+        print(line)
+    if differences:
+        return 1
+    print(f"all {len(current['programs'])} programs match {path.relative_to(HERE)}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--metadata-root", type=Path, default=REPO.parent / "secha-metadata")
@@ -501,6 +523,9 @@ def main() -> int:
     report.add_argument("--results", type=Path, nargs="+", required=True)
     report.add_argument("--out", type=Path, help="where to write the merged report")
 
+    inventory = sub.add_parser("inventory")
+    inventory.add_argument("--write", action="store_true", help="record, instead of check")
+
     args = parser.parse_args()
     commands = {
         "build-cases": cmd_build_cases,
@@ -509,6 +534,7 @@ def main() -> int:
         "probe-context": cmd_probe_context,
         "run": cmd_run,
         "report": cmd_report,
+        "inventory": cmd_inventory,
     }
     return commands[args.command](args)
 

@@ -208,6 +208,11 @@ A run writes its results after every sample and skips samples already recorded, 
 interrupted run resumes where it stopped. Replies are cached per provider, model, request and
 sample index.
 
+The recorded programs are replayed on Kempower, a vendor none of them saw, under a protocol
+registered before the replay ran: [kempower_replay/PROTOCOL.md](kempower_replay/PROTOCOL.md).
+`python harness.py inventory` checks that every program it names is still exactly what a
+cached model reply contained.
+
 ## Results
 
 See [findings.md](findings.md).
