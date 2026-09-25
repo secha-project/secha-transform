@@ -28,6 +28,12 @@ method, and the corrections made to the harness during the runs, are in [README.
   cannot process the source shape it was not shown.
 - **phi4-14b cannot do this task.** 1 of 20 programs passed on the vendor it was shown, none
   passed on another vendor, and repair did not help.
+- **On a vendor none of them saw, the best generated engines followed the contract perfectly,
+  and their output is still unusable.** Replayed on Kempower
+  ([below](#kempower-the-same-programs-on-a-vendor-none-of-them-saw)), all 10 kimi-k3
+  interpreters wrote exactly what the contract prescribes. The contract never anticipated that
+  source, so its output gives every reading of a quantity the same identity: 5 identities for
+  2,000 rows.
 - **Mistral Medium did not run.** Mistral's free plan gives it a limit of zero requests.
 
 ## Scores
@@ -202,3 +208,139 @@ contract for a later run would state both points.
   study on 2026-09-14, and Mistral's limit for Medium dropped to zero within two weeks of a
   successful probe. Cached replies re-score exactly; new replies from the same weights cannot
   be guaranteed. Mistral reported serving `codestral-2508` for all 26 of its replies.
+
+## Kempower: the same programs on a vendor none of them saw
+
+Replayed on 2026-09-25 under [kempower_replay/PROTOCOL.md](kempower_replay/PROTOCOL.md), which
+was registered before the replay's code existed (commit `11d69cd`). The replay code is at
+`74971f2`, and the protocol records two deviations, D1 and D2, neither of which changes a score.
+No model was called. The 60 final programs of the September runs were run again, each verified
+to be exactly what its cached model reply contained. All seven gates passed, among them a
+positive control that is exact against the engine and a negative control that is caught, and the
+replay ran once.
+
+Kempower was landed after the programs were written, and the contract was frozen before that.
+It is a wide source like MX Electrix, with three constructs the contract never describes: a
+column's own aggregation, a row id taken from the row's position in its landed part, and
+charging sessions. The engine absorbed them with five generic capabilities and no vendor logic
+(onboarding diary, Step 4). The inputs were the golden contract's 6 synthetic records (24 rows)
+and two samples of real landed parts chosen by a fixed rule: 200 records (1,000 rows) and 400
+records (2,000 rows). The real samples hold no rejected record, no suspect value and no null
+cell, so only the synthetic input exercises those paths.
+
+### The contract's ceiling
+
+The reference interpreter follows the contract exactly. On Kempower it ran on every input and
+differed from the engine in three fields only: a null row id on every row, the default
+aggregation on every state of charge and temperature row (9 of 24, 400 of 1,000, 800 of 2,000),
+and therefore the identity hash. Every other field and every statistic matched the engine's.
+
+For this source the identity hash is built from fields that are the same for every reading of a
+quantity: one device, no clock time and, under the contract, no row id. So the reference writes
+5 distinct `measurement_id` values per input: 5 for 24 rows, 5 for 1,000 and 5 for 2,000. The
+canonical table merges on `measurement_id`, so a load that followed the contract exactly would
+keep 5 Kempower rows, however many it read.
+
+### Scores
+
+A program is *contract-exact* when its output equals the reference interpreter's on all three
+inputs: every row, every statistic and every identity hash.
+
+| Model | Interpreters that run on every input | Pass against the engine | Contract-exact | Correct on everything the contract describes |
+|---|---|---|---|---|
+| kimi-k3 | 10 of 10 | 0 | 10 of 10 | 10 of 10 |
+| codestral-2508 | 8 of 10 | 0 | 2 of 10 | 5 of 10 |
+| phi4-14b | 0 of 10 | 0 | 0 of 10 | 0 of 10 |
+
+Of the 30 snapshot programs, 29 run and write no row at all, and one crashes on a meter field
+that Kempower does not have. They carry MX Electrix's or ProCem's configuration, written in.
+
+All five predictions registered before the replay held, judged by code written before the run:
+nothing passes against the engine on any input (P1); the reference departs from the engine in
+exactly the three fields above (P2) and writes at most 5 identities per input (P3); 10, 2 and 0
+interpreters are contract-exact, inside the registered bounds of at least 7, 2 to 5 and at most
+1, with programs shown MX Electrix doing at least as well as those shown ProCem (P4); and no
+snapshot program writes a row of the reference's output (P5). Two things qualify this. The
+positive control is the reference with two patches, and it was exact before the replay ran, so
+it had already implied most of P2 and P3; the protocol required that order. And kimi-k3's
+bound of 7 was conservative.
+
+### How failures are classified
+
+The rule of the September classification applies, with the protocol's two additions, fixed
+before the replay: criterion 3 is checked against the reference interpreter rather than the
+engine, and a departure from the engine in a field the contract does not govern for this source
+(the row id, the identity hash, the aggregation of state of charge and temperature, and any
+session field) belongs to the contract, not to the model.
+
+- **kimi-k3: nothing to classify.** All 10 interpreters wrote exactly what the contract
+  prescribes, identity hashes included. In September, 6 of its 10 failed strictly on the vendor
+  they were not shown, 5 of them on two points the contract left open. Kempower touches neither:
+  it has no epoch timestamps and no generated rules.
+- **codestral-2508: 5 correct on everything the contract describes, 5 with a defect.** Besides
+  the 2 contract-exact programs, 3 programs shown MX Electrix followed the aggregation each
+  column declares, a rulebook key the contract does not describe. With that set aside, each
+  equals the reference exactly, statistics included, and its identity hashes are computed as
+  Section 6 says. Its departures from the engine are the row id and the identity hash only, so
+  it is closer to the engine than the contract is. The scorer's near-miss diagnosis also named
+  `quantity` on 12 rows of these programs. That is its heuristic pairing a state of charge
+  reading with a temperature reading of equal value, which it can do only because the row id is
+  null; the comparison with aggregation set aside shows every quantity correct. The five
+  defects:
+  - one builds the device id from a meter field that Kempower does not declare (Sections 4.2 and
+    4.4 make it conditional);
+  - two shown ProCem leave the wide shape unimplemented, with a comment where it would go, and
+    write no rows;
+  - one handles only the long shape and rejects every record on every input, 606 in all, where
+    the engine rejects 1;
+  - one refuses the wide shape outright.
+
+  Four of the five were shown ProCem. As in September, most codestral-2508 interpreters handle
+  only the source shape they were shown.
+- **phi4-14b: every program has a defect.** All 10 crash on every input, each on a rulebook key:
+  five read a `datetime_format` and one a `timestamp_field`, keys for which the contract gives a
+  default; three read keys of the long shape (`key_field`, `rows`) from a wide rulebook; and one
+  reads a quantity from a record rule.
+
+No permitted reading was needed. None of the four points the protocol declared silent caused a
+failure: no program crashed on a record without a timestamp field or on the absent generated
+rules. The phi4-14b program that crashed on `timestamp_field` read the rulebook key, which the
+contract defaults, not the record's field.
+
+### What no program did
+
+- **No program wrote a row id,** although the rulebook declares `row_id_from: payload_position`
+  and every record carries its position. So each of the 15 interpreters that wrote rows collapses
+  identity to at most 5 values per input.
+- **No program wrote a session,** because the contract's output has no session fields. The
+  engine writes 2, 2 and 400 sessions on the three inputs.
+
+### What this means for the thesis
+
+- **The best generated engine followed its specification perfectly on an unseen vendor, and the
+  result is still unusable.** kimi-k3's 10 interpreters wrote what the contract prescribes. Loaded
+  into the canonical table, that output would keep 5 rows of any Kempower load, and it would
+  record state of charge and temperature as averages. The failure is the specification's:
+  written for two vendors, it could not say what a third would need.
+- **The metadata-driven engine absorbs a new source shape; a generated one inherits the limits of
+  its specification.** For Kempower the engine gained five generic capabilities, and the rulebook
+  declared the row id and the aggregations. A generated interpreter would need its specification
+  revised and the program generated and verified again, and that verification needs the real
+  engine as its oracle.
+- **Going beyond the specification happens, but only in part.** Three codestral-2508 programs
+  followed a rulebook key the contract never mentions and got the aggregation right. None of them
+  used the row id, which the same rulebook declares, so all three still collapse identity.
+- **Per-vendor generated code gives a new vendor nothing.** 29 of the 30 snapshot programs ran and
+  wrote no rows.
+- **Capability still decides whether this works at all.** phi4-14b's interpreters crashed on
+  every Kempower input.
+
+### Limitations of the replay
+
+- **The ceiling is our contract.** A contract written by someone else, or revised after
+  September, would leave different gaps; the replay measures the contract as it was frozen.
+- **One vendor and few inputs.** Kempower is one source, and its three inputs are small. The real
+  samples exercise the normal path only.
+- **Two predictions were settled early.** The positive control implied most of P2 and P3 before
+  the replay ran, as the protocol's order required.
+- **Small samples.** Ten interpreters per model, as in September.

@@ -279,3 +279,13 @@ with every identity hash equal as well.
 
 Both were found while writing the replay code, before any program ran on Kempower input.
 Neither changes a prediction, a program, an input or a measure.
+
+### D2, 2026-09-25: snapshot programs are reported, not examined one by one
+
+The rule of findings.md does not examine a snapshot program that fails a drift case, because its
+configuration is written into it. The 30 snapshot programs on Kempower are the same case: each
+carries MX Electrix's or ProCem's configuration, so none can follow Kempower's rulebook. Their
+outcome is reported as measured (29 run and write no rows; one crashes on a meter field that
+Kempower does not have), and they are not classified one by one. This was decided when
+classification began, after the replay. It changes no score, and P5, the only prediction about
+these programs, had already been judged by the code written before the run.

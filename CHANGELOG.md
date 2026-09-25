@@ -63,6 +63,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 - Results for `phi4-14b` (TUNI Aviary), `moonshotai/kimi-k3` (NVIDIA NIM) and `codestral-2508`
   (Mistral, the commercial arm) in `experiments/llm_codegen/findings.md`. `mistral-medium-2604`
   did not run, because Mistral's free plan gives it a limit of zero requests.
+- The recorded programs replayed on Kempower, a vendor none of them saw, under a protocol
+  registered before the replay's code existed (`experiments/llm_codegen/kempower_replay/`):
+  the program inventory, the case builder, seven gates with a positive and a negative control,
+  scoring against the engine and against the contract's reference interpreter, and a report
+  that judges the registered predictions by code. No model is called. Results in findings.md.
 ### Added (reporting: `scripts/canonical_sample.py`)
 - Exports a real sample of canonical output as one workbook: the rows themselves, the same
   rows through `serving/pq_minute_wide.sql` (executed in SQLite, with `date_trunc`
